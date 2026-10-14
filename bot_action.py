@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-ربات سیگنال‌دهی USD/JPY - استراتژی واقعی بانکی v3
-USD/JPY Signal Bot - Real Bank Strategy v3
+ربات سیگنال‌دهی USD/JPY - نسخه v4 حرفه‌ای
+USD/JPY Signal Bot - Professional v4
 
-اصلاحات نسخه 3:
-1. ورود هوشمند: Market برای continuation، Limit فقط برای reversal/range
-2. Breakout detection: وقتی قیمت سطح رو می‌شکنه، فوراً Market
-3. Momentum entry: اگه مومنتوم قویه، Market نه Limit
-4. منطق صحیح: BOS = continuation = Market، CHoCH = reversal = Limit
-5. حداقل 1 سیگنال روزانه با کیفیت
+ویژگی‌های v4:
+1. تشخیص سشن‌های معاملاتی (London + New York)
+2. ورود Market/Limit بر اساس ستاپ
+3. فیلترهای دقیق Liquidity Sweep
+4. SL با buffer مناسب
+5. ستاپ‌های بانکی: OB, FVG, BOS/CHoCH, Sweep, Breakout
 
-قوانین ورود:
-- BOS صعودی + RSI>55 → MARKET BUY (روند قوی)
-- BOS نزولی + RSI<45 → MARKET SELL (روند قوی)
-- CHoCH صعودی → LIMIT BUY at demand zone (ریورسال)
-- CHoCH نزولی → LIMIT SELL at supply zone (ریورسال)
-- Range → LIMIT at boundaries
-- Breakout → MARKET
+ستاپ‌های قابل تشخیص:
+- Continuation: BOS + Retest → Market
+- Reversal: CHoCH + Sweep → Limit
+- Range Scalp: Range Boundaries → Limit
+- Breakout: Level Break + Volume → Market
+- Pullback: Trend + Pullback to EMA → Limit
+
+سشن‌ها (UTC):
+- Asia: 00:00 - 07:00
+- London: 07:00 - 16:00
+- New York: 12:00 - 21:00
+- London+NY Overlap: 12:00 - 16:00 (بهترین زمان ترید)
 """
 
 import os
@@ -24,11 +29,11 @@ import sys
 import json
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 # ============================================================
-# نصب خودکار وابستگی‌ها (فقط در صورت نیاز)
+# نصب وابستگی‌ها
 # ============================================================
 def install_dependencies():
     try:
@@ -37,18 +42,13 @@ def install_dependencies():
         import numpy
         import requests
         from dotenv import load_dotenv
-        print("✅ وابستگی‌ها موجودند")
         return True
     except ImportError:
-        print("📦 در حال نصب وابستگی‌ها...")
         deps = ["yfinance", "pandas", "numpy", "requests", "python-dotenv"]
         for dep in deps:
-            ret = os.system(f'pip install {dep} --quiet 2>&1')
-            if ret != 0:
-                ret = os.system(f'pip3 install {dep} --quiet 2>&1')
-                if ret != 0:
-                    os.system(f'python -m pip install {dep} --quiet 2>&1')
-        print("✅ نصب کامل شد")
+            os.system(f'pip install {dep} --quiet 2>&1')
+            os.system(f'pip3 install {dep} --quiet 2>&1')
+            os.system(f'python -m pip install {dep} --quiet 2>&1')
         return True
 
 install_dependencies()
@@ -60,9 +60,7 @@ try:
     import requests
     from dotenv import load_dotenv
 except ImportError as e:
-    print(f"❌ خطا در ایمپورت: {e}")
-    print("لطفاً دستور زیر را اجرا کنید:")
-    print("pip install yfinance pandas numpy requests python-dotenv")
+    print(f"❌ خطا: {e}")
     sys.exit(1)
 
 load_dotenv()
@@ -82,6 +80,7 @@ TF_HTF = "1d"
 TF_PATTERN = "1h"
 TF_TRIGGER = "15m"
 
+# پارامترهای اندیکاتور
 EMA_FAST = 21
 EMA_MID = 50
 EMA_SLOW = 200
@@ -89,20 +88,98 @@ RSI_PERIOD = 14
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
 ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 1.5
+ATR_SL_MULTIPLIER = 2.0  # افزایش از 1.5 به 2.0 برای SL منطقی‌تر
+ATR_TP_MULTIPLIER = 6.0   # ریسک/ریوارد 1:3
 
-# آستانه مومنتوم برای ورود Market
-MOMENTUM_THRESHOLD = 55  # RSI بالای 55 برای BUY market، زیر 45 برای SELL market
+# فاصله‌های دقیق (درصد)
+ZONE_PROXIMITY_PCT = 0.15   # 0.15% نزدیک ناحیه = ورود Market
+RANGE_BOUNDARY_PCT = 0.20   # 0.20% نزدیک سقف/کف رنج
+SWEEP_THRESHOLD_PCT = 0.10  # 0.10% شکست برای Liquidity Sweep
+BREAKOUT_THRESHOLD_PCT = 0.15  # 0.15% شکست برای Breakout
+
+# سشن‌های معاملاتی (UTC) - ساعت شروع و پایان
+SESSIONS = {
+    'asia': {'start': 0, 'end': 7, 'name': ' آسیا 🌏'},
+    'london': {'start': 7, 'end': 16, 'name': ' لندن 🇬🇧'},
+    'new_york': {'start': 12, 'end': 21, 'name': ' نیویورک 🇺🇸'},
+    'overlap': {'start': 12, 'end': 16, 'name': ' همپوشانی لندن+نیویورک 🔥'},
+}
+
+# آستانه‌های سیگنال
+MIN_SIGNAL_STRENGTH = 60
+STRONG_SIGNAL_STRENGTH = 75
 
 SIGNALS_DB_FILE = "signals_db.json"
-LAST_SIGNAL_FILE = "last_signal.json"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Data Fetcher (جلوگیری از Repainting)
+# Session Detector
+# ============================================================
+class SessionDetector:
+    """تشخیص سشن معاملاتی فعلی"""
+
+    def get_current_session(self):
+        try:
+            # زمان فعلی UTC
+            now_utc = datetime.now(timezone.utc)
+            hour = now_utc.hour
+
+            sessions = []
+
+            # بررسی همپوشانی (بهترین زمان)
+            if SESSIONS['overlap']['start'] <= hour < SESSIONS['overlap']['end']:
+                sessions.append('overlap')
+
+            # لندن
+            if SESSIONS['london']['start'] <= hour < SESSIONS['london']['end']:
+                sessions.append('london')
+
+            # نیویورک
+            if SESSIONS['new_york']['start'] <= hour < SESSIONS['new_york']['end']:
+                sessions.append('new_york')
+
+            # آسیا
+            if SESSIONS['asia']['start'] <= hour < SESSIONS['asia']['end']:
+                sessions.append('asia')
+
+            if not sessions:
+                return {
+                    'name': 'بسته 🌙',
+                    'is_active': False,
+                    'is_best_time': False,
+                    'description': 'بازار بسته - ترید توصیه نمی‌شه',
+                }
+
+            # اولویت: overlap > london > new_york > asia
+            if 'overlap' in sessions:
+                primary = 'overlap'
+            elif 'london' in sessions:
+                primary = 'london'
+            elif 'new_york' in sessions:
+                primary = 'new_york'
+            else:
+                primary = 'asia'
+
+            is_best = primary in ['overlap', 'london', 'new_york']
+
+            return {
+                'name': SESSIONS[primary]['name'],
+                'is_active': True,
+                'is_best_time': is_best,
+                'primary': primary,
+                'all_active': sessions,
+                'hour_utc': hour,
+                'description': f"سشن {SESSIONS[primary]['name']} (UTC: {hour}:00)",
+            }
+        except Exception as e:
+            return {'name': 'نامشخص', 'is_active': True, 'is_best_time': True, 'description': f'خطا: {e}'}
+
+
+# ============================================================
+# Data Fetcher
 # ============================================================
 class DataFetcher:
     def __init__(self):
@@ -111,7 +188,6 @@ class DataFetcher:
         self._cache_time = {}
 
     def fetch_closed_candles(self, timeframe, count=300):
-        """فقط کندل‌های بسته‌شده"""
         import time as t
         cache_key = f"{timeframe}_{count}"
         if cache_key in self._cache and cache_key in self._cache_time:
@@ -134,8 +210,7 @@ class DataFetcher:
             df = df.dropna(subset=['open', 'high', 'low', 'close'])
             if len(df) > count + 1:
                 df = df.tail(count + 1)
-            # حذف کندل آخر (در حال تشکیل)
-            df = df.iloc[:-1].copy()
+            df = df.iloc[:-1].copy()  # حذف کندل در حال تشکیل
 
             self._cache[cache_key] = df
             self._cache_time[cache_key] = t.time()
@@ -143,14 +218,6 @@ class DataFetcher:
         except Exception as e:
             logger.error(f"خطا در دریافت داده {timeframe}: {e}")
             raise
-
-    def get_current_price(self):
-        """قیمت لحظه‌ای (برای مقایسه)"""
-        try:
-            df = self.fetch_closed_candles(TF_TRIGGER, count=5)
-            return float(df['close'].iloc[-1])
-        except:
-            return 0
 
 
 # ============================================================
@@ -187,12 +254,21 @@ class MarketContextAnalyzer:
             if is_range and len(swing_highs) >= 2 and len(swing_lows) >= 2:
                 range_high = max(swing_highs[-3:]) if len(swing_highs) >= 3 else max(swing_highs)
                 range_low = min(swing_lows[-3:]) if len(swing_lows) >= 3 else min(swing_lows)
+                # محاسبه جایگاه قیمت در رنج
+                range_size = range_high - range_low
+                if range_size > 0:
+                    position_in_range = (price - range_low) / range_size * 100
+                else:
+                    position_in_range = 50
+
                 return {
                     'trend': 'range',
                     'strength': 50,
                     'description': f"بازار رنج ({range_low:.2f} - {range_high:.2f})",
                     'range_high': range_high,
                     'range_low': range_low,
+                    'range_size': range_size,
+                    'position_in_range': position_in_range,
                     'price': price,
                     'is_range': True,
                 }
@@ -254,6 +330,7 @@ class PatternAnalyzer:
             structure = self._detect_structure(df)
             liquidity = self._find_liquidity_sweep(df)
             breakout = self._detect_breakout(df)
+            pullback = self._detect_pullback(df)
 
             zones = []
             for ob in obs['bullish']:
@@ -274,6 +351,7 @@ class PatternAnalyzer:
                 'structure': structure,
                 'liquidity_sweep': liquidity,
                 'breakout': breakout,
+                'pullback': pullback,
                 'current_price': cp,
                 'description': f"{len(valid_zones)} ناحیه، ساختار: {structure.get('description', 'نامشخص')}",
             }
@@ -331,57 +409,113 @@ class PatternAnalyzer:
                 last_sh, prev_sh = swing_highs[-1], swing_highs[-2]
                 last_sl, prev_sl = swing_lows[-1], swing_lows[-2]
 
-                # BOS صعودی: قیمت آخرین سقف رو شکسته (continuation)
                 if cp > last_sh['price'] and last_sh['index'] > prev_sh['index']:
                     result.update(structure='bullish', bos='bullish', type='continuation', description='BOS صعودی - ادامه روند صعودی')
-                # BOS نزولی: قیمت آخرین کف رو شکسته (continuation)
                 elif cp < last_sl['price'] and last_sl['index'] > prev_sl['index']:
                     result.update(structure='bearish', bos='bearish', type='continuation', description='BOS نزولی - ادامه روند نزولی')
-                # CHoCH صعودی: ریورسال
                 elif cp > last_sh['price'] and last_sl['index'] > prev_sl['index']:
                     result.update(structure='bullish', choch='bullish', type='reversal', description='CHoCH صعودی - تغییر روند به صعودی')
-                # CHoCH نزولی: ریورسال
                 elif cp < last_sl['price'] and last_sh['index'] > prev_sh['index']:
                     result.update(structure='bearish', choch='bearish', type='reversal', description='CHoCH نزولی - تغییر روند به نزولی')
         except: pass
         return result
 
     def _find_liquidity_sweep(self, df, lookback=30):
+        """Liquidity Sweep - شکست فیک با فیلتر دقیق"""
         try:
             recent = df.tail(lookback).copy()
             if len(recent) < 10:
                 return {'detected': False}
+
+            # سطح مهم اخیر (5 کندل قبل)
             recent_high = recent['high'].iloc[:-3].max()
             recent_low = recent['low'].iloc[:-3].min()
             cp = recent['close'].iloc[-1]
-            if recent['low'].iloc[-1] < recent_low and cp > recent_low:
-                return {'detected': True, 'type': 'bullish', 'description': 'Liquidity Sweep صعودی - شکست فیک کف'}
-            if recent['high'].iloc[-1] > recent_high and cp < recent_high:
-                return {'detected': True, 'type': 'bearish', 'description': 'Liquidity Sweep نزولی - شکست فیک سقف'}
+
+            # محاسبه فاصله
+            high_dist_pct = abs(recent['high'].iloc[-1] - recent_high) / recent_high * 100
+            low_dist_pct = abs(recent['low'].iloc[-1] - recent_low) / recent_low * 100
+
+            # Bullish Sweep: قیمت کف رو شکسته (با حداقل فاصله) ولی بسته‌شده بالاتر
+            if (recent['low'].iloc[-1] < recent_low and
+                low_dist_pct > 0.05 and  # حداقل شکست 0.05%
+                cp > recent_low):
+                return {'detected': True, 'type': 'bullish', 'description': f'Liquidity Sweep صعودی - شکست فیک کف ({recent_low:.3f})', 'level': recent_low}
+
+            # Bearish Sweep: قیمت سقف رو شکسته ولی بسته‌شده پایین‌تر
+            if (recent['high'].iloc[-1] > recent_high and
+                high_dist_pct > 0.05 and
+                cp < recent_high):
+                return {'detected': True, 'type': 'bearish', 'description': f'Liquidity Sweep نزولی - شکست فیک سقف ({recent_high:.3f})', 'level': recent_high}
+
             return {'detected': False}
         except:
             return {'detected': False}
 
     def _detect_breakout(self, df, lookback=20):
-        """تشخیص breakout - وقتی قیمت سطح مهم رو می‌شکنه"""
+        """Breakout با فیلتر دقیق"""
         try:
             recent = df.tail(lookback).copy()
             if len(recent) < 10:
                 return {'detected': False}
 
-            # سطوح مقاومت و حمایت اخیر
             resistance = recent['high'].iloc[:-3].max()
             support = recent['low'].iloc[:-3].min()
             cp = recent['close'].iloc[-1]
             prev_cp = recent['close'].iloc[-2]
 
-            # Breakout صعودی: قیمت مقاومت رو شکسته و بالاتر بسته شده
-            if cp > resistance and prev_cp <= resistance:
+            # فاصله شکست
+            breakout_dist = abs(cp - resistance) / resistance * 100 if cp > resistance else abs(cp - support) / support * 100
+
+            # Breakout صعودی
+            if (cp > resistance and
+                prev_cp <= resistance and
+                breakout_dist > BREAKOUT_THRESHOLD_PCT / 2):
                 return {'detected': True, 'type': 'bullish', 'description': f'Breakout صعودی - شکست {resistance:.3f}', 'level': resistance}
 
             # Breakout نزولی
-            if cp < support and prev_cp >= support:
+            if (cp < support and
+                prev_cp >= support and
+                breakout_dist > BREAKOUT_THRESHOLD_PCT / 2):
                 return {'detected': True, 'type': 'bearish', 'description': f'Breakout نزولی - شکست {support:.3f}', 'level': support}
+
+            return {'detected': False}
+        except:
+            return {'detected': False}
+
+    def _detect_pullback(self, df, lookback=50):
+        """تشخیص Pullback به EMA در روند"""
+        try:
+            recent = df.tail(lookback).copy()
+            if len(recent) < EMA_SLOW:
+                return {'detected': False}
+
+            ema21 = recent['close'].ewm(span=EMA_FAST, adjust=False).mean()
+            ema50 = recent['close'].ewm(span=EMA_MID, adjust=False).mean()
+            ema200 = recent['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+
+            cp = recent['close'].iloc[-1]
+
+            # روند صعودی: EMA50 > EMA200
+            if ema50.iloc[-1] > ema200.iloc[-1]:
+                # Pullback به EMA21 یا EMA50
+                dist_to_ema21 = abs(cp - ema21.iloc[-1]) / cp * 100
+                dist_to_ema50 = abs(cp - ema50.iloc[-1]) / cp * 100
+
+                if dist_to_ema21 < 0.1:
+                    return {'detected': True, 'type': 'bullish', 'description': f'Pullback به EMA21 ({ema21.iloc[-1]:.3f})', 'level': ema21.iloc[-1]}
+                if dist_to_ema50 < 0.15:
+                    return {'detected': True, 'type': 'bullish', 'description': f'Pullback به EMA50 ({ema50.iloc[-1]:.3f})', 'level': ema50.iloc[-1]}
+
+            # روند نزولی: EMA50 < EMA200
+            if ema50.iloc[-1] < ema200.iloc[-1]:
+                dist_to_ema21 = abs(cp - ema21.iloc[-1]) / cp * 100
+                dist_to_ema50 = abs(cp - ema50.iloc[-1]) / cp * 100
+
+                if dist_to_ema21 < 0.1:
+                    return {'detected': True, 'type': 'bearish', 'description': f'Pullback به EMA21 ({ema21.iloc[-1]:.3f})', 'level': ema21.iloc[-1]}
+                if dist_to_ema50 < 0.15:
+                    return {'detected': True, 'type': 'bearish', 'description': f'Pullback به EMA50 ({ema50.iloc[-1]:.3f})', 'level': ema50.iloc[-1]}
 
             return {'detected': False}
         except:
@@ -405,6 +539,7 @@ class TriggerAnalyzer:
             patterns = self._detect_patterns(df)
             rsi = self._calc_rsi(df)
             ema_trend = self._calc_ema_trend(df)
+            momentum = self._calc_momentum(df)
 
             bull_score = 0
             bear_score = 0
@@ -425,6 +560,11 @@ class TriggerAnalyzer:
             elif ema_trend == 'bearish':
                 bear_score += 0.5
 
+            if momentum > 0:
+                bull_score += min(0.5, abs(momentum) * 0.1)
+            elif momentum < 0:
+                bear_score += min(0.5, abs(momentum) * 0.1)
+
             if bull_score > bear_score:
                 direction = 'bullish'
                 strength = min(100, bull_score * 50)
@@ -439,10 +579,11 @@ class TriggerAnalyzer:
                 'patterns': patterns,
                 'rsi': rsi,
                 'ema_trend': ema_trend,
+                'momentum': momentum,
                 'direction': direction,
                 'strength': strength,
                 'current_price': cp,
-                'description': f"تریگر: {direction} (RSI: {rsi:.0f}, {len(patterns)} الگو)",
+                'description': f"تریگر: {direction} (RSI: {rsi:.0f}, Mom: {momentum:.1f}, {len(patterns)} الگو)",
             }
         except Exception as e:
             logger.error(f"خطا در Trigger: {e}")
@@ -515,30 +656,47 @@ class TriggerAnalyzer:
         except:
             return 'neutral'
 
+    def _calc_momentum(self, df):
+        """محاسبه مومنتوم (تغییرات 5 کندل)"""
+        try:
+            if len(df) < 5:
+                return 0
+            cp = df['close'].iloc[-1]
+            past = df['close'].iloc[-5]
+            return float((cp - past) / past * 1000)  # ضریب 1000 برای مقیاس
+        except:
+            return 0
+
 
 # ============================================================
-# Signal Engine - منطق ورود هوشمند
+# Signal Engine v4 - منطق هوشمند و تهاجمی
 # ============================================================
 class SignalEngine:
     """
-    موتور سیگنال با منطق ورود هوشمند
+    موتور سیگنال v4
 
-    قوانین ورود:
-    1. BOS + Momentum → MARKET (روند قوی)
-    2. CHoCH → LIMIT at zone (ریورسال)
-    3. Breakout → MARKET (شکست سطح)
-    4. Range → LIMIT at boundaries
-    5. Liquidity Sweep → MARKET
+    ستاپ‌های قابل تشخیص:
+    1. Breakout + Continuation → MARKET
+    2. Liquidity Sweep + Reversal → MARKET
+    3. BOS + Momentum → MARKET
+    4. CHoCH + Zone → LIMIT
+    5. Pullback to EMA in Trend → LIMIT
+    6. Range Scalp → LIMIT at boundaries
     """
 
     def __init__(self):
         self.fetcher = DataFetcher()
+        self.session = SessionDetector()
         self.context = MarketContextAnalyzer()
         self.pattern = PatternAnalyzer()
         self.trigger = TriggerAnalyzer()
 
     def analyze(self):
         try:
+            print("\n📊 سشن معاملاتی...")
+            session = self.session.get_current_session()
+            print(f"   {session['description']}")
+
             print("\n📊 لایه 1: Context (Daily)...")
             context = self.context.analyze()
             print(f"   {context['description']}")
@@ -556,15 +714,17 @@ class SignalEngine:
                 cp = pattern.get('current_price', 0)
 
             structure = pattern.get('structure', {})
-            struct_type = structure.get('type', 'none')  # continuation یا reversal یا none
+            struct_type = structure.get('type', 'none')
             struct_dir = 'bullish' if structure.get('structure') == 'bullish' else 'bearish' if structure.get('structure') == 'bearish' else 'neutral'
 
             rsi = trigger.get('rsi', 50)
+            momentum = trigger.get('momentum', 0)
             breakout = pattern.get('breakout', {})
             liquidity = pattern.get('liquidity_sweep', {})
+            pullback = pattern.get('pullback', {})
 
             # ============================================
-            # تعیین جهت و نوع ورود - منطق هوشمند
+            # تصمیم‌گیری هوشمند - اولویت‌بندی ستاپ‌ها
             # ============================================
 
             direction = 'WAIT'
@@ -572,64 +732,79 @@ class SignalEngine:
             entry_price = cp
             entry_reason = ""
             strength = 0
+            setup_type = ""
 
             # ============================================
-            # حالت 1: Breakout (قوی‌ترین سیگنال)
+            # ستاپ 1: Breakout (قوی‌ترین) - MARKET
             # ============================================
             if breakout.get('detected'):
                 direction = 'BUY' if breakout['type'] == 'bullish' else 'SELL'
                 entry_type = 'market'
                 entry_price = cp
-                entry_reason = f"Breakout {breakout['type']} - شکست سطح {breakout.get('level', 0):.3f}"
+                entry_reason = f"🔥 Breakout {breakout['type']} - {breakout.get('description', '')}"
                 strength = 85
-                print(f"   ✓ Breakout detected: {direction}")
+                setup_type = "Breakout"
+                print(f"   ✓ Breakout Setup: {direction}")
 
             # ============================================
-            # حالت 2: Liquidity Sweep (شکست فیک)
+            # ستاپ 2: Liquidity Sweep + Reversal - MARKET
             # ============================================
             elif liquidity.get('detected'):
-                direction = 'BUY' if liquidity['type'] == 'bullish' else 'SELL'
-                entry_type = 'market'
-                entry_price = cp
-                entry_reason = f"Liquidity Sweep - {liquidity.get('description', '')}"
-                strength = 80
-                print(f"   ✓ Liquidity Sweep: {direction}")
-
-            # ============================================
-            # حالت 3: BOS + Momentum (continuation - MARKET)
-            # ============================================
-            elif struct_type == 'continuation' and struct_dir != 'neutral':
-                # بررسی مومنتوم
-                if struct_dir == 'bullish' and rsi > 50:
+                sweep_dir = liquidity.get('type')
+                # تأیید با RSI
+                if sweep_dir == 'bullish' and rsi < 60:
                     direction = 'BUY'
                     entry_type = 'market'
                     entry_price = cp
-                    entry_reason = f"BOS صعودی + Momentum (RSI: {rsi:.0f}) - ورود Market"
-                    strength = 75
-                    print(f"   ✓ Continuation BUY (Market)")
-                elif struct_dir == 'bearish' and rsi < 50:
+                    entry_reason = f"🔥 Sweep صعودی + RSI {rsi:.0f} - {liquidity.get('description', '')}"
+                    strength = 80
+                    setup_type = "Liquidity Sweep"
+                    print(f"   ✓ Sweep Setup: {direction}")
+                elif sweep_dir == 'bearish' and rsi > 40:
                     direction = 'SELL'
                     entry_type = 'market'
                     entry_price = cp
-                    entry_reason = f"BOS نزولی + Momentum (RSI: {rsi:.0f}) - ورود Market"
-                    strength = 75
-                    print(f"   ✓ Continuation SELL (Market)")
+                    entry_reason = f"🔥 Sweep نزولی + RSI {rsi:.0f} - {liquidity.get('description', '')}"
+                    strength = 80
+                    setup_type = "Liquidity Sweep"
+                    print(f"   ✓ Sweep Setup: {direction}")
                 else:
-                    # continuation ولی مومنتوم ضعیف - صبر کن
+                    # sweep هست اما RSI تأیید نمی‌کنه
                     direction = 'WAIT'
-                    entry_reason = f"BOS {struct_dir} اما مومنتوم ضعیف (RSI: {rsi:.0f})"
+                    entry_reason = f"Sweep {sweep_dir} اما RSI {rsi:.0f} تأیید نمی‌کنه"
 
             # ============================================
-            # حالت 4: CHoCH (reversal - LIMIT)
+            # ستاپ 3: BOS + Momentum (Continuation) - MARKET
+            # ============================================
+            elif struct_type == 'continuation' and struct_dir != 'neutral':
+                if struct_dir == 'bullish' and rsi > 50 and momentum > 0:
+                    direction = 'BUY'
+                    entry_type = 'market'
+                    entry_price = cp
+                    entry_reason = f"🚀 BOS صعودی + Momentum ({momentum:.1f}) - ادامه روند صعودی"
+                    strength = 75
+                    setup_type = "Continuation"
+                    print(f"   ✓ Continuation BUY: {direction}")
+                elif struct_dir == 'bearish' and rsi < 50 and momentum < 0:
+                    direction = 'SELL'
+                    entry_type = 'market'
+                    entry_price = cp
+                    entry_reason = f"🚀 BOS نزولی + Momentum ({momentum:.1f}) - ادامه روند نزولی"
+                    strength = 75
+                    setup_type = "Continuation"
+                    print(f"   ✓ Continuation SELL: {direction}")
+                else:
+                    direction = 'WAIT'
+                    entry_reason = f"BOS {struct_dir} اما مومنتوم ضعیف (RSI: {rsi:.0f}, Mom: {momentum:.1f})"
+
+            # ============================================
+            # ستاپ 4: CHoCH (Reversal) - LIMIT
             # ============================================
             elif struct_type == 'reversal' and struct_dir != 'neutral':
-                # پیدا کردن ناحیه مناسب برای LIMIT
                 zones = pattern.get('all_zones', [])
                 if struct_dir == 'bullish':
-                    # برای BUY reversal، ناحیه demand زیر قیمت
                     suitable = [z for z in zones if z['type'] == 'demand' and z['price'] < cp]
                 else:
-                    # برای SELL reversal، ناحیه supply بالای قیمت
                     suitable = [z for z in zones if z['type'] == 'supply' and z['price'] > cp]
 
                 if suitable:
@@ -639,76 +814,89 @@ class SignalEngine:
                     direction = 'BUY' if struct_dir == 'bullish' else 'SELL'
                     entry_type = 'limit'
                     entry_price = nearest['price']
-                    entry_reason = f"CHoCH {struct_dir} - Limit at {nearest['source']} zone ({distance_pct:.2f}%)"
+                    entry_reason = f"🔄 CHoCH {struct_dir} - Limit در {nearest['source']} ({distance_pct:.2f}%)"
                     strength = 70
+                    setup_type = "Reversal"
                     print(f"   ✓ Reversal {direction} (Limit at {entry_price:.3f})")
                 else:
                     # ناحیه مناسب نیست - Market
                     direction = 'BUY' if struct_dir == 'bullish' else 'SELL'
                     entry_type = 'market'
                     entry_price = cp
-                    entry_reason = f"CHoCH {struct_dir} - ورود Market (ناحیه مناسب نیست)"
+                    entry_reason = f"🔄 CHoCH {struct_dir} - ورود Market (ناحیه مناسب نیست)"
                     strength = 65
+                    setup_type = "Reversal"
 
             # ============================================
-            # حالت 5: Range (LIMIT at boundaries)
+            # ستاپ 5: Pullback به EMA در روند - LIMIT
+            # ============================================
+            elif pullback.get('detected'):
+                direction = 'BUY' if pullback['type'] == 'bullish' else 'SELL'
+                entry_type = 'market'  # چون قیمت الان نزدیک EMA هست
+                entry_price = cp
+                entry_reason = f"📊 Pullback Setup - {pullback.get('description', '')}"
+                strength = 70
+                setup_type = "Pullback"
+                print(f"   ✓ Pullback Setup: {direction}")
+
+            # ============================================
+            # ستاپ 6: Range Scalp - LIMIT
             # ============================================
             elif context.get('is_range'):
                 range_high = context.get('range_high', 0)
                 range_low = context.get('range_low', 0)
+                position = context.get('position_in_range', 50)
 
-                # اگر نزدیک کف هست - BUY
-                if range_low > 0 and abs(cp - range_low) / range_low * 100 < 0.3:
+                # نزدیک کف رنج - BUY
+                if position < 20:
                     direction = 'BUY'
                     entry_type = 'market'
                     entry_price = cp
-                    entry_reason = f"در رنج - نزدیک کف ({range_low:.3f})"
+                    entry_reason = f"📊 Range Scalp - نزدیک کف رنج (موقعیت: {position:.0f}%)"
                     strength = 65
-                    print(f"   ✓ Range BUY (at low)")
-                # اگر نزدیک سقف هست - SELL
-                elif range_high > 0 and abs(cp - range_high) / range_high * 100 < 0.3:
+                    setup_type = "Range Scalp"
+                    print(f"   ✓ Range BUY (near low)")
+                # نزدیک سقف رنج - SELL
+                elif position > 80:
                     direction = 'SELL'
                     entry_type = 'market'
                     entry_price = cp
-                    entry_reason = f"در رنج - نزدیک سقف ({range_high:.3f})"
+                    entry_reason = f"📊 Range Scalp - نزدیک سقف رنج (موقعیت: {position:.0f}%)"
                     strength = 65
-                    print(f"   ✓ Range SELL (at high)")
-                # در وسط رنج - LIMIT
-                elif range_low > 0 and range_high > 0:
-                    if cp < (range_high + range_low) / 2:
-                        # نزدیک‌تر به کف - Limit BUY at low
-                        direction = 'BUY'
-                        entry_type = 'limit'
-                        entry_price = range_low
-                        entry_reason = f"در رنج - Limit BUY at {range_low:.3f}"
-                        strength = 55
-                    else:
-                        direction = 'SELL'
-                        entry_type = 'limit'
-                        entry_price = range_high
-                        entry_reason = f"در رنج - Limit SELL at {range_high:.3f}"
-                        strength = 55
-                    print(f"   ✓ Range {direction} (Limit)")
+                    setup_type = "Range Scalp"
+                    print(f"   ✓ Range SELL (near high)")
+                # در وسط رنج - صبر کن
+                else:
+                    direction = 'WAIT'
+                    entry_reason = f"در وسط رنج (موقعیت: {position:.0f}%) - ترید نمی‌شه"
 
             # ============================================
-            # حالت 6: فقط تریگر قوی
+            # ستاپ 7: Trigger قوی (fallback)
             # ============================================
             else:
                 trig_dir = trigger.get('direction', 'neutral')
                 trig_strength = trigger.get('strength', 0)
-                if trig_strength >= 60 and trig_dir != 'neutral':
+                if trig_strength >= MIN_SIGNAL_STRENGTH and trig_dir != 'neutral':
                     direction = 'BUY' if trig_dir == 'bullish' else 'SELL'
                     entry_type = 'market'
                     entry_price = cp
-                    entry_reason = f"تریگر قوی {trig_dir} (قدرت: {trig_strength:.0f}%)"
-                    strength = 60
-                    print(f"   ✓ Trigger-only {direction}")
+                    entry_reason = f"⚡ تریگر قوی {trig_dir} (قدرت: {trig_strength:.0f}%)"
+                    strength = trig_strength
+                    setup_type = "Trigger"
+                    print(f"   ✓ Trigger-only: {direction}")
                 else:
                     direction = 'WAIT'
-                    entry_reason = "هیچ سیگنال قوی وجود ندارد"
+                    entry_reason = "هیچ ستاپ معتبری پیدا نشد"
 
             # ============================================
-            # محاسبه SL/TP
+            # فیلتر سشن: اگه بازار بسته باشه، فقط WAIT
+            # ============================================
+            if not session.get('is_active', True) and direction != 'WAIT':
+                direction = 'WAIT'
+                entry_reason = f"بازار بسته - {entry_reason}"
+
+            # ============================================
+            # محاسبه SL/TP با buffer مناسب
             # ============================================
             atr_val = self._calc_atr()
             stop_loss = tp1 = tp2 = tp3 = None
@@ -727,7 +915,8 @@ class SignalEngine:
                     tp2 = entry_price - risk * 2.0
                     tp3 = entry_price - risk * 3.0
 
-            confidence = 'high' if strength >= 75 else 'medium' if strength >= 60 else 'low'
+            # اطمینان
+            confidence = 'high' if strength >= STRONG_SIGNAL_STRENGTH else 'medium' if strength >= MIN_SIGNAL_STRENGTH else 'low'
 
             # محاسبه درصد صعودی/نزولی
             if direction == 'BUY':
@@ -752,9 +941,11 @@ class SignalEngine:
                 'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
                 'risk_reward': 3.0,
                 'timestamp': datetime.now().isoformat(),
+                'session': session,
                 'context': context,
                 'pattern': pattern,
                 'trigger': trigger,
+                'setup_type': setup_type,
                 'reason': entry_reason,
             }
         except Exception as e:
@@ -791,15 +982,17 @@ class AIDecisionMaker:
             context = signal.get('context', {})
             pattern = signal.get('pattern', {})
             trigger = signal.get('trigger', {})
+            session = signal.get('session', {})
 
             prompt = f"""
 شما یک تریدر حرفه‌ای بانک هستید. این سیگنال USD/JPY را بررسی کنید:
 
 سیگنال: {signal['direction']} (قدرت: {signal['strength']:.0f}%)
-قیمت فعلی: {signal.get('current_price', 0):.3f}
+ستاپ: {signal.get('setup_type', 'نامشخص')}
 نوع ورود: {signal.get('entry_type', 'نامشخص')}
-نقطه ورود: {signal.get('entry_price', 0):.3f}
+قیمت فعلی: {signal.get('current_price', 0):.3f}
 
+سشن: {session.get('description', '')}
 Context: {context.get('description', '')}
 Pattern: {pattern.get('description', '')}
 Trigger: {trigger.get('description', '')}
@@ -809,7 +1002,7 @@ Trigger: {trigger.get('description', '')}
 به فارسی و مختصر (حداکثر 100 کلمه):
 1. آیا موافقی؟
 2. نقاط قوت/ضعف
-3. توصیه
+3. توصیه نهایی
 """
             response = requests.post(
                 "https://api.z.ai/api/paas/v4/chat/completions",
@@ -841,6 +1034,7 @@ class StatsManager:
             minimal = {
                 'direction': signal['direction'],
                 'strength': signal.get('strength', 0),
+                'setup': signal.get('setup_type'),
                 'entry_type': signal.get('entry_type'),
                 'price': signal.get('current_price'),
                 'timestamp': signal['timestamp'],
@@ -878,15 +1072,24 @@ def format_signal_message(signal, ai_analysis=None):
 
     conf_icon = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(signal.get('confidence', 'low'), "⚪")
 
-    msg = f"{icon} سیگنال {dir_fa} USD/JPY\n"
+    msg = f"{icon} سیگنال {dir_fa} USD/JPY (v4)\n"
     msg += f"{'='*30}\n\n"
 
-    msg += f"💰 قیمت فعلی: {signal.get('current_price', 0):.3f}\n"
+    # سشن
+    session = signal.get('session', {})
+    msg += f"🌐 سشن: {session.get('name', 'نامشخص')}\n"
+    if session.get('is_best_time'):
+        msg += "🔥 زمان طلایی ترید!\n"
+
+    msg += f"\n💰 قیمت فعلی: {signal.get('current_price', 0):.3f}\n"
     if direction in ['BUY', 'SELL']:
         entry_type = signal.get('entry_type', 'market')
         entry_icon = "⚡" if entry_type == 'market' else "📋"
         msg += f"{entry_icon} نوع ورود: {entry_type.upper()}\n"
         msg += f"🔹 نقطه ورود: {signal.get('entry_price', 0):.3f}\n"
+        setup = signal.get('setup_type', '')
+        if setup:
+            msg += f"🎯 ستاپ: {setup}\n"
     msg += f"💪 قدرت: {signal.get('strength', 0):.0f}%\n"
     msg += f"{conf_icon} اطمینان: {signal.get('confidence', 'low')}\n"
     msg += f"🕐 زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -895,7 +1098,10 @@ def format_signal_message(signal, ai_analysis=None):
     context = signal.get('context', {})
     msg += "📊 Context (Daily):\n"
     msg += "-"*30 + "\n"
-    msg += f"• {context.get('description', 'نامشخص')}\n\n"
+    msg += f"• {context.get('description', 'نامشخص')}\n"
+    if context.get('is_range'):
+        msg += f"• موقعیت در رنج: {context.get('position_in_range', 0):.0f}%\n"
+    msg += "\n"
 
     # Pattern
     pattern = signal.get('pattern', {})
@@ -906,10 +1112,13 @@ def format_signal_message(signal, ai_analysis=None):
     msg += f"• ساختار: {structure.get('description', 'نامشخص')}\n"
     breakout = pattern.get('breakout', {})
     if breakout.get('detected'):
-        msg += f"• {breakout.get('description', '')}\n"
+        msg += f"• 🔥 {breakout.get('description', '')}\n"
     liq = pattern.get('liquidity_sweep', {})
     if liq.get('detected'):
-        msg += f"• {liq.get('description', '')}\n"
+        msg += f"• 🔥 {liq.get('description', '')}\n"
+    pullback = pattern.get('pullback', {})
+    if pullback.get('detected'):
+        msg += f"• 📊 {pullback.get('description', '')}\n"
     msg += "\n"
 
     # Trigger
@@ -929,13 +1138,14 @@ def format_signal_message(signal, ai_analysis=None):
         msg += "📌 مشخصات معامله:\n"
         msg += "-"*30 + "\n"
         if signal.get('stop_loss'):
-            msg += f"🛑 حد ضرر: {signal['stop_loss']:.3f} ({abs(signal.get('entry_price', 0) - signal['stop_loss'])*100:.1f} پیپ)\n"
+            sl_pips = abs(signal.get('entry_price', 0) - signal['stop_loss']) * 100
+            msg += f"🛑 حد ضرر: {signal['stop_loss']:.3f} ({sl_pips:.1f} پیپ)\n"
         if signal.get('tp1'):
-            msg += f"🎯 TP1: {signal['tp1']:.3f}\n"
+            msg += f"🎯 TP1: {signal['tp1']:.3f} (+{abs(signal.get('entry_price', 0) - signal['tp1'])*100:.1f} پیپ)\n"
         if signal.get('tp2'):
-            msg += f"🎯 TP2: {signal['tp2']:.3f}\n"
+            msg += f"🎯 TP2: {signal['tp2']:.3f} (+{abs(signal.get('entry_price', 0) - signal['tp2'])*100:.1f} پیپ)\n"
         if signal.get('tp3'):
-            msg += f"🎯 TP3: {signal['tp3']:.3f}\n"
+            msg += f"🎯 TP3: {signal['tp3']:.3f} (+{abs(signal.get('entry_price', 0) - signal['tp3'])*100:.1f} پیپ)\n"
         msg += f"⚖️ ریسک/ریوارد: 1:3\n\n"
 
     if ai_analysis:
@@ -954,7 +1164,7 @@ def format_signal_message(signal, ai_analysis=None):
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 ربات سیگنال USD/JPY - v3 (ورود هوشمند)")
+    print("🤖 ربات سیگنال USD/JPY - v4 حرفه‌ای")
     print("=" * 60)
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -973,6 +1183,7 @@ def main():
 
     print(f"\n📊 نتیجه:")
     print(f"جهت: {signal['direction']}")
+    print(f"ستاپ: {signal.get('setup_type', 'نامشخص')}")
     print(f"نوع ورود: {signal.get('entry_type', 'نامشخص')}")
     print(f"قدرت: {signal.get('strength', 0):.0f}%")
     print(f"دلیل: {signal.get('reason', '')}")
