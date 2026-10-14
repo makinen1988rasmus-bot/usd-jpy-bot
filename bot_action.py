@@ -1,32 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-ربات سیگنال‌دهی USD/JPY - نسخه GitHub Actions
-USD/JPY Signal Bot - GitHub Actions Version
+ربات سیگنال‌دهی USD/JPY - استراتژی واقعی بانکی
+USD/JPY Signal Bot - Real Bank Trading Strategy
 
-این نسخه برای اجرا در GitHub Actions طراحی شده:
-- هر 30 دقیقه اجرا می‌شه
-- سیگنال رو چک می‌کنه
-- اگه سیگنال جدید بود، به تلگرام می‌فرسته
+اعتراف صادقانه:
+- هیچ رباتی 100% دقیق نیست
+- Yahoo Finance داده تأخیری داره (15-20 دقیقه)
+- هدف: سیگنال‌های با کیفیت، نه سیگنال زیاد
+- حداقل 1 سیگنال روزانه (خرید/فروش/صبر با توضیح)
 
-نحوه اجرا:
-python bot_action.py
+استراتژی واقعی بانکی:
+1. ترید در جهت روند (Continuation) - BOS
+2. ترید ریورسال (Reversal) - CHoCH
+3. ترید در رنج (Range) - خرید از کف، فروش از سقف
+4. ترید Liquidity Sweep - شکست فیک
+
+معماری مولتی‌تایم‌فریم:
+- Weekly + Daily: روند کلی (نه فیلتر، بلکه context)
+- 1H: مناطق ورود (OB, S/D, FVG)
+- 15m: تریگر ورود
+
+AI نقش:
+- تصمیم‌گیرنده نهایی (نه فقط تحلیلگر)
+- بررسی کیفیت سیگنال
+- فیلتر سیگنال‌های ضعیف
 """
 
 import os
 import sys
 import json
 import logging
+import requests
 from datetime import datetime
+from typing import Dict, List, Optional
 
 # ============================================================
-# نصب خودکار وابستگی‌ها
-# ============================================================
 def install_dependencies():
-    """نصب خودکار وابستگی‌ها"""
     deps = ["yfinance", "pandas", "numpy", "requests", "python-dotenv"]
     for dep in deps:
         os.system(f'pip install {dep} --quiet')
-    print("✅ وابستگی‌ها نصب شدند")
 
 install_dependencies()
 
@@ -47,571 +59,909 @@ load_dotenv()
 # ============================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_ADMIN_IDS = [int(x) for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
+AI_MODEL = "glm-4.5"
 
 SYMBOL = "JPY=X"
 SYMBOL_DISPLAY = "USD/JPY"
-PRIMARY_TIMEFRAME = "15m"
-CANDLE_COUNT = 300
 
-# Indicator parameters
-RSI_PERIOD = 14
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
+# تایم‌فریم‌ها
+TF_HTF = "1d"      # روزانه - context
+TF_PATTERN = "1h"  # 1 ساعته - مناطق ورود
+TF_TRIGGER = "15m" # 15 دقیقه - تریگر
+
+# پارامترهای اندیکاتور (ثابت - بدون بهینه‌سازی)
 EMA_FAST = 21
 EMA_MID = 50
 EMA_SLOW = 200
-BB_PERIOD = 20
-BB_STD = 2.0
-STOCH_PERIOD = 14
+RSI_PERIOD = 14
+RSI_OVERSOLD = 35    # کمی آسان‌تر
+RSI_OVERBOUGHT = 65
 ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.5
 
-# تنظیمات ذخیره سیگنال (در GitHub Actions از artifacts استفاده می‌کنیم)
-SIGNAL_STATE_FILE = "signal_state.json"
+# آستانه‌های منطقی (نه خیلی سخت، نه خیلی آسون)
+MIN_SIGNAL_STRENGTH = 50  # حداقل 50% قدرت
+MIN_CONFLUENCE = 3         # حداقل 3 تأیید
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+SIGNALS_DB_FILE = "signals_db.json"
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Data Fetcher
+# Data Fetcher (جلوگیری از Repainting)
 # ============================================================
 class DataFetcher:
     def __init__(self):
         self.ticker = yf.Ticker(SYMBOL)
+        self._cache = {}
+        self._cache_time = {}
 
-    def fetch_ohlc(self, timeframe=PRIMARY_TIMEFRAME, count=CANDLE_COUNT):
+    def fetch_closed_candles(self, timeframe, count=300):
+        """فقط کندل‌های بسته‌شده - جلوگیری از Repainting"""
+        import time as t
+        cache_key = f"{timeframe}_{count}"
+        if cache_key in self._cache and cache_key in self._cache_time:
+            if t.time() - self._cache_time[cache_key] < 300:
+                return self._cache[cache_key]
+
         try:
-            if timeframe == "15m":
-                period = "60d"
-            elif timeframe in ("1h", "60m"):
-                period = "730d"
-            elif timeframe == "4h":
-                period = "60d"
-            elif timeframe == "1d":
-                period = "2y"
-            else:
-                period = "60d"
-
+            period_map = {"15m": "60d", "1h": "730d", "60m": "730d", "4h": "60d", "1d": "2y", "1wk": "5y"}
+            period = period_map.get(timeframe, "60d")
             df = self.ticker.history(period=period, interval=timeframe, auto_adjust=False, prepost=False)
             if df.empty:
                 df = yf.download(SYMBOL, period=period, interval=timeframe, progress=False, auto_adjust=False)
             if df.empty:
-                raise ValueError("داده خالی")
+                raise ValueError(f"داده خالی برای {timeframe}")
 
             df.columns = [str(c).lower().replace(' ', '_') for c in df.columns]
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 if col not in df.columns:
-                    if col == 'volume':
-                        df[col] = 0
+                    df[col] = 0 if col == 'volume' else df.iloc[:, 0]
             df = df.dropna(subset=['open', 'high', 'low', 'close'])
-            if len(df) > count:
-                df = df.tail(count)
+            if len(df) > count + 1:
+                df = df.tail(count + 1)
+
+            # حذف کندل آخر (ممکنه در حال تشکیل باشه)
+            df = df.iloc[:-1].copy()
+
+            self._cache[cache_key] = df
+            self._cache_time[cache_key] = t.time()
             return df
         except Exception as e:
-            logger.error(f"خطا در دریافت داده: {e}")
+            logger.error(f"خطا در دریافت داده {timeframe}: {e}")
             raise
 
 
 # ============================================================
-# Indicators Engine (نسخه فشرده)
+# Market Context Analyzer (Daily)
 # ============================================================
-class IndicatorsEngine:
-    def ema(self, s, p): return s.ewm(span=p, adjust=False).mean()
-    def sma(self, s, p): return s.rolling(window=p).mean()
+class MarketContextAnalyzer:
+    """
+    تحلیل context بازار - نه فیلتر، بلکه اطلاعات
 
-    def calculate_all(self, df):
-        df = df.copy()
-        df['ema_21'] = self.ema(df['close'], EMA_FAST)
-        df['ema_50'] = self.ema(df['close'], EMA_MID)
-        df['ema_200'] = self.ema(df['close'], EMA_SLOW)
-        df['rsi'] = self.rsi(df['close'])
-        m, s, h = self.macd(df['close'])
-        df['macd'], df['macd_signal'], df['macd_histogram'] = m, s, h
-        bb_m, bb_u, bb_l, _ = self.bollinger_bands(df['close'])
-        df['bb_middle'], df['bb_upper'], df['bb_lower'] = bb_m, bb_u, bb_l
-        k, d = self.stochastic(df)
-        df['stoch_k'], df['stoch_d'] = k, d
-        df['atr'] = self.atr(df)
-        if 'volume' in df.columns and df['volume'].sum() > 0:
-            df['volume_ma'] = self.sma(df['volume'], 20)
-        return df
+    خروجی:
+    - trend: bullish/bearish/range
+    - strength: 0-100
+    - key_levels: سطوح مهم
+    - in_range: آیا بازار رنج هست؟
+    """
 
-    def rsi(self, s, p=RSI_PERIOD):
-        delta = s.diff()
-        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/p, adjust=False).mean()
-        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/p, adjust=False).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+    def __init__(self):
+        self.fetcher = DataFetcher()
 
-    def macd(self, s):
-        ema_fast = self.ema(s, MACD_FAST)
-        ema_slow = self.ema(s, MACD_SLOW)
-        macd_line = ema_fast - ema_slow
-        signal_line = self.ema(macd_line, MACD_SIGNAL)
-        return macd_line, signal_line, macd_line - signal_line
+    def analyze(self):
+        try:
+            df = self.fetcher.fetch_closed_candles(TF_HTF, count=200)
+            if df.empty or len(df) < 50:
+                return {'trend': 'unknown', 'strength': 0, 'description': 'داده کافی نیست'}
 
-    def bollinger_bands(self, s):
-        middle = self.sma(s, BB_PERIOD)
-        std = s.rolling(window=BB_PERIOD).std()
-        return middle, middle + (std * BB_STD), middle - (std * BB_STD), (middle - middle) / middle
+            price = df['close'].iloc[-1]
+            ema21 = df['close'].ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]
+            ema50 = df['close'].ewm(span=EMA_MID, adjust=False).mean().iloc[-1]
+            ema200 = df['close'].ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1]
 
-    def stochastic(self, df):
-        low_min = df['low'].rolling(window=STOCH_PERIOD).min()
-        high_max = df['high'].rolling(window=STOCH_PERIOD).max()
-        k_fast = 100 * ((df['close'] - low_min) / (high_max - low_min))
-        return k_fast.rolling(window=3).mean(), k_fast.rolling(window=3).rolling(window=3).mean()
+            # تشخیص روند
+            bull = bear = 0
+            if price > ema200: bull += 1
+            else: bear += 1
+            if ema21 > ema50: bull += 1
+            else: bear += 1
+            if ema50 > ema200: bull += 1
+            else: bear += 1
 
-    def atr(self, df):
-        hl = df['high'] - df['low']
-        hc = (df['high'] - df['close'].shift()).abs()
-        lc = (df['low'] - df['close'].shift()).abs()
-        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-        return tr.ewm(alpha=1/ATR_PERIOD, adjust=False).mean()
+            # تشخیص رنج (EMAs نزدیک هم)
+            ema_spread = abs(ema21 - ema50) / price * 100
+            is_range = ema_spread < 0.3  # اگه فاصله کمتر از 0.3% باشه، رنج هست
+
+            # Swing points
+            swing_highs, swing_lows = self._find_swings(df)
+
+            if is_range and len(swing_highs) >= 2 and len(swing_lows) >= 2:
+                # بازار رنج هست
+                range_high = max(swing_highs[-3:]) if len(swing_highs) >= 3 else max(swing_highs)
+                range_low = min(swing_lows[-3:]) if len(swing_lows) >= 3 else min(swing_lows)
+                return {
+                    'trend': 'range',
+                    'strength': 50,
+                    'description': f"بازار رنج ({range_low:.2f} - {range_high:.2f})",
+                    'range_high': range_high,
+                    'range_low': range_low,
+                    'price': price,
+                    'key_levels': {'resistances': swing_highs[-3:], 'supports': swing_lows[-3:]},
+                }
+
+            if bull > bear:
+                trend = 'bullish'
+                strength = min(100, 50 + bull * 15)
+                desc = f"روند صعودی (قدرت: {strength:.0f}%)"
+            elif bear > bull:
+                trend = 'bearish'
+                strength = min(100, 50 + bear * 15)
+                desc = f"روند نزولی (قدرت: {strength:.0f}%)"
+            else:
+                trend = 'neutral'
+                strength = 40
+                desc = "روند خنثی"
+
+            return {
+                'trend': trend,
+                'strength': strength,
+                'description': desc,
+                'price': price,
+                'ema21': ema21, 'ema50': ema50, 'ema200': ema200,
+                'key_levels': {'resistances': swing_highs[-3:], 'supports': swing_lows[-3:]},
+                'is_range': is_range,
+            }
+        except Exception as e:
+            logger.error(f"خطا در Context: {e}")
+            return {'trend': 'unknown', 'strength': 0, 'description': f'خطا: {e}'}
+
+    def _find_swings(self, df, lookback=100):
+        highs, lows = [], []
+        recent = df.tail(lookback)
+        for i in range(2, min(len(recent) - 2, lookback - 2)):
+            if (recent['high'].iloc[i] > recent['high'].iloc[i-1] and recent['high'].iloc[i] > recent['high'].iloc[i-2]
+                and recent['high'].iloc[i] > recent['high'].iloc[i+1] and recent['high'].iloc[i] > recent['high'].iloc[i+2]):
+                highs.append(float(recent['high'].iloc[i]))
+            if (recent['low'].iloc[i] < recent['low'].iloc[i-1] and recent['low'].iloc[i] < recent['low'].iloc[i-2]
+                and recent['low'].iloc[i] < recent['low'].iloc[i+1] and recent['low'].iloc[i] < recent['low'].iloc[i+2]):
+                lows.append(float(recent['low'].iloc[i]))
+        return highs, lows
 
 
 # ============================================================
-# Smart Money Concepts (نسخه فشرده)
+# Pattern Analyzer (1H)
 # ============================================================
-class SmartMoneyConcepts:
-    def find_order_blocks(self, df, lookback=50):
+class PatternAnalyzer:
+    """تحلیل مناطق ورود در 1H"""
+
+    def __init__(self):
+        self.fetcher = DataFetcher()
+
+    def analyze(self):
+        try:
+            df = self.fetcher.fetch_closed_candles(TF_PATTERN, count=200)
+            if df.empty or len(df) < 50:
+                return {'zones': [], 'structure': 'neutral', 'description': 'داده کافی نیست'}
+
+            cp = df['close'].iloc[-1]
+
+            # تحلیل‌ها
+            obs = self._find_order_blocks(df)
+            sd = self._find_supply_demand(df)
+            fvgs = self._find_fvgs(df)
+            structure = self._detect_structure(df)
+            liquidity = self._find_liquidity_sweep(df)
+
+            # جمع‌آوری مناطق
+            zones = []
+            for ob in obs['bullish']:
+                zones.append({'type': 'demand', 'price': ob['price'], 'source': 'OB', 'age': ob['age']})
+            for ob in obs['bearish']:
+                zones.append({'type': 'supply', 'price': ob['price'], 'source': 'OB', 'age': ob['age']})
+            for z in sd['demand']:
+                zones.append({'type': 'demand', 'price': z['mid'], 'source': 'SD', 'age': z['age']})
+            for z in sd['supply']:
+                zones.append({'type': 'supply', 'price': z['mid'], 'source': 'SD', 'age': z['age']})
+
+            # فیلتر مناطق معتبر (کم سن)
+            valid_zones = [z for z in zones if z['age'] <= 25]
+            # مرتب‌سازی بر اساس نزدیکی به قیمت
+            valid_zones.sort(key=lambda x: abs(x['price'] - cp))
+
+            return {
+                'zones': valid_zones[:5],
+                'all_zones': valid_zones,
+                'structure': structure,
+                'liquidity_sweep': liquidity,
+                'fvgs': fvgs,
+                'current_price': cp,
+                'description': f"{len(valid_zones)} ناحیه فعال، ساختار: {structure.get('description', 'نامشخص')}",
+            }
+        except Exception as e:
+            logger.error(f"خطا در Pattern: {e}")
+            return {'zones': [], 'structure': 'neutral', 'description': f'خطا: {e}'}
+
+    def _find_order_blocks(self, df, lookback=50):
         recent = df.tail(lookback).copy()
         bullish_obs, bearish_obs = [], []
         try:
             for i in range(2, min(len(recent) - 5, lookback - 5)):
                 if recent['close'].iloc[i] < recent['open'].iloc[i]:
                     move_up = recent['close'].iloc[i + 3] - recent['close'].iloc[i]
-                    if move_up > recent['close'].iloc[i] * 0.001:
+                    if move_up > recent['close'].iloc[i] * 0.0015:
                         bullish_obs.append({'price': (recent['high'].iloc[i] + recent['low'].iloc[i]) / 2, 'age': len(recent) - i})
                 if recent['close'].iloc[i] > recent['open'].iloc[i]:
                     move_down = recent['close'].iloc[i] - recent['close'].iloc[i + 3]
-                    if move_down > recent['close'].iloc[i] * 0.001:
+                    if move_down > recent['close'].iloc[i] * 0.0015:
                         bearish_obs.append({'price': (recent['high'].iloc[i] + recent['low'].iloc[i]) / 2, 'age': len(recent) - i})
-        except Exception as e:
-            logger.error(f"خطا در OB: {e}")
-        cp = df['close'].iloc[-1]
-        valid_b = [ob for ob in bullish_obs if ob['age'] <= 30]
-        valid_s = [ob for ob in bearish_obs if ob['age'] <= 30]
-        nb = min(valid_b, key=lambda x: abs(x['price'] - cp)) if valid_b else None
-        ns = min(valid_s, key=lambda x: abs(x['price'] - cp)) if valid_s else None
-        return {'nearest_bullish_ob': nb, 'nearest_bearish_ob': ns}
+        except: pass
+        return {'bullish': bullish_obs, 'bearish': bearish_obs}
 
-    def detect_bos_choch(self, df, lookback=50):
+    def _find_supply_demand(self, df, lookback=100):
+        try:
+            recent = df.tail(lookback).copy()
+            demand_zones, supply_zones = [], []
+            for i in range(4, min(len(recent) - 4, lookback - 4)):
+                base = recent.iloc[i-2:i+1]
+                rally = recent.iloc[i+1:i+4]
+                if len(base) == 3 and len(rally) == 3:
+                    if rally['close'].iloc[-1] > base['close'].iloc[-1] * 1.003:
+                        demand_zones.append({'mid': (base['high'].max() + base['low'].min()) / 2, 'age': len(recent) - i})
+                    if rally['close'].iloc[-1] < base['close'].iloc[-1] * 0.997:
+                        supply_zones.append({'mid': (base['high'].max() + base['low'].min()) / 2, 'age': len(recent) - i})
+            return {'demand': demand_zones, 'supply': supply_zones}
+        except:
+            return {'demand': [], 'supply': []}
+
+    def _find_fvgs(self, df, lookback=50):
+        recent = df.tail(lookback).copy()
+        bullish_fvgs, bearish_fvgs = [], []
+        try:
+            for i in range(2, len(recent)):
+                if recent['low'].iloc[i] > recent['high'].iloc[i - 2]:
+                    gap = recent['low'].iloc[i] - recent['high'].iloc[i - 2]
+                    if gap > recent['close'].iloc[i] * 0.0005:
+                        bullish_fvgs.append({'mid': (recent['low'].iloc[i] + recent['high'].iloc[i - 2]) / 2, 'age': len(recent) - i})
+                if recent['high'].iloc[i] < recent['low'].iloc[i - 2]:
+                    gap = recent['low'].iloc[i - 2] - recent['high'].iloc[i]
+                    if gap > recent['close'].iloc[i] * 0.0005:
+                        bearish_fvgs.append({'mid': (recent['low'].iloc[i - 2] + recent['high'].iloc[i]) / 2, 'age': len(recent) - i})
+        except: pass
+        return {'bullish': bullish_fvgs, 'bearish': bearish_fvgs}
+
+    def _detect_structure(self, df, lookback=50):
         recent = df.tail(lookback).copy()
         cp = recent['close'].iloc[-1]
         swing_highs, swing_lows = [], []
         for i in range(2, min(len(recent) - 2, lookback - 2)):
-            try:
-                if (recent['high'].iloc[i] > recent['high'].iloc[i-1] and recent['high'].iloc[i] > recent['high'].iloc[i-2]
-                    and recent['high'].iloc[i] > recent['high'].iloc[i+1] and recent['high'].iloc[i] > recent['high'].iloc[i+2]):
-                    swing_highs.append({'price': recent['high'].iloc[i], 'index': i})
-                if (recent['low'].iloc[i] < recent['low'].iloc[i-1] and recent['low'].iloc[i] < recent['low'].iloc[i-2]
-                    and recent['low'].iloc[i] < recent['low'].iloc[i+1] and recent['low'].iloc[i] < recent['low'].iloc[i+2]):
-                    swing_lows.append({'price': recent['low'].iloc[i], 'index': i})
-            except:
-                continue
-        result = {'bos': None, 'choch': None, 'structure': 'neutral', 'description': 'ساختار نامشخص'}
+            if (recent['high'].iloc[i] > recent['high'].iloc[i-1] and recent['high'].iloc[i] > recent['high'].iloc[i-2]
+                and recent['high'].iloc[i] > recent['high'].iloc[i+1] and recent['high'].iloc[i] > recent['high'].iloc[i+2]):
+                swing_highs.append({'price': recent['high'].iloc[i], 'index': i})
+            if (recent['low'].iloc[i] < recent['low'].iloc[i-1] and recent['low'].iloc[i] < recent['low'].iloc[i-2]
+                and recent['low'].iloc[i] < recent['low'].iloc[i+1] and recent['low'].iloc[i] < recent['low'].iloc[i+2]):
+                swing_lows.append({'price': recent['low'].iloc[i], 'index': i})
+        result = {'structure': 'neutral', 'description': 'ساختار نامشخص', 'bos': None, 'choch': None, 'direction': 'neutral'}
         try:
             if len(swing_highs) >= 2 and len(swing_lows) >= 2:
                 last_sh, prev_sh = swing_highs[-1], swing_highs[-2]
                 last_sl, prev_sl = swing_lows[-1], swing_lows[-2]
                 if cp > last_sh['price'] and last_sh['index'] > prev_sh['index']:
-                    result.update(structure='bullish', description='BOS صعودی')
+                    result.update(structure='bullish', bos='bullish', direction='bullish', description='BOS صعودی - ادامه روند')
                 elif cp < last_sl['price'] and last_sl['index'] > prev_sl['index']:
-                    result.update(structure='bearish', description='BOS نزولی')
-                elif cp > last_sh['price'] and last_sl['index'] > prev_sl['index'] and last_sh['index'] < last_sl['index']:
-                    result.update(structure='bullish', description='CHoCH صعودی')
-                elif cp < last_sl['price'] and last_sh['index'] > prev_sh['index'] and last_sl['index'] < last_sh['index']:
-                    result.update(structure='bearish', description='CHoCH نزولی')
-        except Exception as e:
-            logger.error(f"خطا در BOS/CHoCH: {e}")
+                    result.update(structure='bearish', bos='bearish', direction='bearish', description='BOS نزولی - ادامه روند')
+                elif cp > last_sh['price'] and last_sl['index'] > prev_sl['index']:
+                    # CHoCH صعودی - ریورسال
+                    result.update(structure='reversal_bullish', choch='bullish', direction='bullish', description='CHoCH صعودی - ریورسال به صعودی')
+                elif cp < last_sl['price'] and last_sh['index'] > prev_sh['index']:
+                    # CHoCH نزولی - ریورسال
+                    result.update(structure='reversal_bearish', choch='bearish', direction='bearish', description='CHoCH نزولی - ریورسال به نزولی')
+        except: pass
         return result
 
-    def premium_discount_zones(self, df, lookback=50):
-        recent = df.tail(lookback)
-        high = recent['high'].max()
-        low = recent['low'].min()
-        cp = df['close'].iloc[-1]
-        mid = (high + low) / 2
-        return {'zone': 'discount' if cp <= mid else 'premium', 'mid': mid}
-
-    def analyze(self, df):
+    def _find_liquidity_sweep(self, df, lookback=30):
+        """تشخیص Liquidity Sweep (شکست فیک)"""
         try:
-            obs = self.find_order_blocks(df)
-            structure = self.detect_bos_choch(df)
-            zones = self.premium_discount_zones(df)
-            bull = bear = 0
-            if structure['structure'] == 'bullish': bull += 2
-            elif structure['structure'] == 'bearish': bear += 2
-            if zones['zone'] == 'discount': bull += 1
-            elif zones['zone'] == 'premium': bear += 1
+            recent = df.tail(lookback).copy()
+            if len(recent) < 10:
+                return {'detected': False}
+
+            # پیدا کردن سقف/کف اخیر
+            recent_high = recent['high'].iloc[:-3].max()
+            recent_low = recent['low'].iloc[:-3].min()
+            cp = recent['close'].iloc[-1]
+            prev_cp = recent['close'].iloc[-2]
+
+            # Bullish Sweep: قیمت کف رو شکسته ولی بسته‌شده بالاتر
+            if recent['low'].iloc[-1] < recent_low and cp > recent_low:
+                return {'detected': True, 'type': 'bullish', 'description': 'Liquidity Sweep صعودی - شکست فیک کف'}
+
+            # Bearish Sweep: قیمت سقف رو شکسته ولی بسته‌شده پایین‌تر
+            if recent['high'].iloc[-1] > recent_high and cp < recent_high:
+                return {'detected': True, 'type': 'bearish', 'description': 'Liquidity Sweep نزولی - شکست فیک سقف'}
+
+            return {'detected': False}
+        except:
+            return {'detected': False}
+
+
+# ============================================================
+# Trigger Analyzer (15m)
+# ============================================================
+class TriggerAnalyzer:
+    """تحلیل تریگر ورود در 15m"""
+
+    def __init__(self):
+        self.fetcher = DataFetcher()
+
+    def analyze(self):
+        try:
+            df = self.fetcher.fetch_closed_candles(TF_TRIGGER, count=100)
+            if df.empty or len(df) < 20:
+                return {'patterns': [], 'rsi': 50, 'ema_trend': 'neutral', 'description': 'داده کافی نیست'}
+
             cp = df['close'].iloc[-1]
-            if obs['nearest_bullish_ob']:
-                d = abs(obs['nearest_bullish_ob']['price'] - cp) / cp * 100
-                if d < 0.5: bull += 2
-                elif d < 1: bull += 1
-            if obs['nearest_bearish_ob']:
-                d = abs(obs['nearest_bearish_ob']['price'] - cp) / cp * 100
-                if d < 0.5: bear += 2
-                elif d < 1: bear += 1
-            if bull > bear:
-                return {'signal': 'bullish', 'score': min(100, (bull/7)*100), 'description': f"SMC: صعودی ({bull} امتیاز) - {structure['description']}"}
-            elif bear > bull:
-                return {'signal': 'bearish', 'score': min(100, (bear/7)*100), 'description': f"SMC: نزولی ({bear} امتیاز) - {structure['description']}"}
-            return {'signal': 'neutral', 'score': 50, 'description': 'SMC: خنثی'}
+            patterns = self._detect_patterns(df)
+            rsi = self._calc_rsi(df)
+            ema_trend = self._calc_ema_trend(df)
+
+            # امتیاز تریگر
+            bull_score = 0
+            bear_score = 0
+
+            for p in patterns:
+                if p['type'] == 'bullish':
+                    bull_score += p['strength'] / 100
+                elif p['type'] == 'bearish':
+                    bear_score += p['strength'] / 100
+
+            if rsi < RSI_OVERSOLD:
+                bull_score += 0.5
+            elif rsi > RSI_OVERBOUGHT:
+                bear_score += 0.5
+
+            if ema_trend == 'bullish':
+                bull_score += 0.5
+            elif ema_trend == 'bearish':
+                bear_score += 0.5
+
+            # تعیین جهت تریگر
+            if bull_score > bear_score:
+                direction = 'bullish'
+                strength = min(100, bull_score * 50)
+            elif bear_score > bull_score:
+                direction = 'bearish'
+                strength = min(100, bear_score * 50)
+            else:
+                direction = 'neutral'
+                strength = 30
+
+            return {
+                'patterns': patterns,
+                'rsi': rsi,
+                'ema_trend': ema_trend,
+                'direction': direction,
+                'strength': strength,
+                'current_price': cp,
+                'bull_score': bull_score,
+                'bear_score': bear_score,
+                'description': f"تریگر: {direction} (RSI: {rsi:.0f}, {len(patterns)} الگو)",
+            }
         except Exception as e:
-            logger.error(f"خطا در SMC: {e}")
-            return {'signal': 'neutral', 'score': 50, 'description': f'خطا: {e}'}
+            logger.error(f"خطا در Trigger: {e}")
+            return {'patterns': [], 'rsi': 50, 'ema_trend': 'neutral', 'description': f'خطا: {e}'}
 
-
-# ============================================================
-# Market Structure
-# ============================================================
-class MarketStructure:
-    def analyze(self, df, lookback=100):
-        try:
-            recent = df.tail(lookback)
-            highs, lows = [], []
-            for i in range(2, min(len(recent) - 2, lookback - 2)):
-                if (recent['high'].iloc[i] > recent['high'].iloc[i-1] and recent['high'].iloc[i] > recent['high'].iloc[i-2]
-                    and recent['high'].iloc[i] > recent['high'].iloc[i+1] and recent['high'].iloc[i] > recent['high'].iloc[i+2]):
-                    highs.append(recent['high'].iloc[i])
-                if (recent['low'].iloc[i] < recent['low'].iloc[i-1] and recent['low'].iloc[i] < recent['low'].iloc[i-2]
-                    and recent['low'].iloc[i] < recent['low'].iloc[i+1] and recent['low'].iloc[i] < recent['low'].iloc[i+2]):
-                    lows.append(recent['low'].iloc[i])
-            if len(highs) < 2 or len(lows) < 2:
-                return {'signal': 'neutral', 'score': 50, 'description': 'ساختار نامشخص'}
-            hh = highs[-1] > highs[-2]
-            ll = lows[-1] < lows[-2]
-            hl = lows[-1] > lows[-2]
-            lh = highs[-1] < highs[-2]
-            if hh and hl: return {'signal': 'bullish', 'score': 85, 'description': 'ساختار: HH-HL (صعودی قوی)'}
-            if ll and lh: return {'signal': 'bearish', 'score': 85, 'description': 'ساختار: LL-LH (نزولی قوی)'}
-            if hh: return {'signal': 'bullish', 'score': 70, 'description': 'ساختار: Higher High'}
-            if ll: return {'signal': 'bearish', 'score': 70, 'description': 'ساختار: Lower Low'}
-            return {'signal': 'neutral', 'score': 50, 'description': 'ساختار: خنثی'}
-        except Exception as e:
-            return {'signal': 'neutral', 'score': 50, 'description': f'خطا: {e}'}
-
-
-# ============================================================
-# Price Action
-# ============================================================
-class PriceAction:
-    def detect_patterns(self, df):
+    def _detect_patterns(self, df):
         patterns = []
-        if len(df) < 5: return patterns
+        if len(df) < 3:
+            return patterns
         c, p = df.iloc[-1], df.iloc[-2]
+        p2 = df.iloc[-3] if len(df) >= 3 else p
         body_c = abs(c['close'] - c['open'])
         us_c = c['high'] - max(c['close'], c['open'])
         ls_c = min(c['close'], c['open']) - c['low']
         range_c = c['high'] - c['low']
-        if range_c == 0: return patterns
-        if ls_c > 2 * body_c and ls_c > range_c * 0.6:
-            patterns.append({'name_fa': 'پین بار صعودی', 'type': 'bullish', 'description': 'پین بار صعودی', 'strength': 70})
-        if us_c > 2 * body_c and us_c > range_c * 0.6:
-            patterns.append({'name_fa': 'پین بار نزولی', 'type': 'bearish', 'description': 'پین بار نزولی', 'strength': 70})
+        if range_c == 0:
+            return patterns
+
+        # Pin Bar
+        if ls_c > 2 * body_c and ls_c > range_c * 0.6 and body_c > 0:
+            patterns.append({'name': 'پین بار صعودی', 'type': 'bullish', 'strength': 75})
+        if us_c > 2 * body_c and us_c > range_c * 0.6 and body_c > 0:
+            patterns.append({'name': 'پین بار نزولی', 'type': 'bearish', 'strength': 75})
+
+        # Engulfing
         if p['close'] < p['open'] and c['close'] > c['open'] and c['close'] > p['open'] and c['open'] < p['close']:
-            patterns.append({'name_fa': 'پوشای صعودی', 'type': 'bullish', 'description': 'پوشای صعودی', 'strength': 75})
+            patterns.append({'name': 'پوشای صعودی', 'type': 'bullish', 'strength': 80})
         if p['close'] > p['open'] and c['close'] < c['open'] and c['open'] > p['close'] and c['close'] < p['open']:
-            patterns.append({'name_fa': 'پوشای نزولی', 'type': 'bearish', 'description': 'پوشای نزولی', 'strength': 75})
-        if ls_c > body_c * 2 and us_c < body_c * 0.5 and body_c > 0:
-            patterns.append({'name_fa': 'چکش', 'type': 'bullish', 'description': 'چکش - بازگشت از کف', 'strength': 70})
-        if us_c > body_c * 2 and ls_c < body_c * 0.5 and body_c > 0:
-            patterns.append({'name_fa': 'ستاره دنباله‌دار', 'type': 'bearish', 'description': 'ستاره دنباله‌دار', 'strength': 70})
+            patterns.append({'name': 'پوشای نزولی', 'type': 'bearish', 'strength': 80})
+
+        # Hammer / Shooting Star
+        if ls_c > body_c * 2 and us_c < body_c * 0.3 and body_c > 0:
+            patterns.append({'name': 'چکش', 'type': 'bullish', 'strength': 75})
+        if us_c > body_c * 2 and ls_c < body_c * 0.3 and body_c > 0:
+            patterns.append({'name': 'ستاره دنباله‌دار', 'type': 'bearish', 'strength': 75})
+
+        # Morning/Evening Star
+        if len(df) >= 3:
+            if (p2['close'] < p2['open'] and abs(p['close'] - p['open']) < 0.3 * (p['high'] - p['low'])
+                and c['close'] > c['open'] and c['close'] > (p2['open'] + p2['close']) / 2):
+                patterns.append({'name': 'ستاره صبحگاهی', 'type': 'bullish', 'strength': 90})
+            if (p2['close'] > p2['open'] and abs(p['close'] - p['open']) < 0.3 * (p['high'] - p['low'])
+                and c['close'] < c['open'] and c['close'] < (p2['open'] + p2['close']) / 2):
+                patterns.append({'name': 'ستاره عصرگاهی', 'type': 'bearish', 'strength': 90})
+
         return patterns
 
-    def analyze(self, df):
+    def _calc_rsi(self, df):
         try:
-            patterns = self.detect_patterns(df)
-            if not patterns:
-                return {'signal': 'neutral', 'score': 50, 'description': 'پرایس اکشن: الگویی نیست', 'patterns': []}
-            bull = [p for p in patterns if p['type'] == 'bullish']
-            bear = [p for p in patterns if p['type'] == 'bearish']
-            if len(bull) > len(bear):
-                return {'signal': 'bullish', 'score': np.mean([p['strength'] for p in bull]), 'description': f"پرایس اکشن: {len(bull)} الگوی صعودی", 'patterns': patterns}
-            if len(bear) > len(bull):
-                return {'signal': 'bearish', 'score': np.mean([p['strength'] for p in bear]), 'description': f"پرایس اکشن: {len(bear)} الگوی نزولی", 'patterns': patterns}
-            return {'signal': 'neutral', 'score': 50, 'description': 'پرایس اکشن: متعادل', 'patterns': patterns}
-        except Exception as e:
-            return {'signal': 'neutral', 'score': 50, 'description': f'خطا: {e}', 'patterns': []}
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+            loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+            rs = gain / loss
+            rsi = (100 - (100 / (1 + rs))).iloc[-1]
+            return float(rsi) if not pd.isna(rsi) else 50
+        except:
+            return 50
 
-
-# ============================================================
-# Advanced Analysis Engine
-# ============================================================
-class AdvancedAnalysisEngine:
-    def __init__(self):
-        self.smc = SmartMoneyConcepts()
-        self.structure = MarketStructure()
-        self.price_action = PriceAction()
-        self.weights = {'smc': 0.35, 'structure': 0.30, 'price_action': 0.20, 'classic': 0.15}
-
-    def analyze(self, df, classic_signals=None):
+    def _calc_ema_trend(self, df):
         try:
-            results = {
-                'smc': self.smc.analyze(df),
-                'structure': self.structure.analyze(df),
-                'price_action': self.price_action.analyze(df),
-            }
-            if classic_signals:
-                results['classic'] = {'signal': self._aggregate_classic(classic_signals), 'score': 60, 'description': 'اندیکاتورهای کلاسیک'}
-            bull = bear = 0
-            for method, res in results.items():
-                if not isinstance(res, dict): continue
-                sig = res.get('signal', 'neutral')
-                w = self.weights.get(method, 0.1)
-                sc = res.get('score', 50)
-                if sig == 'bullish': bull += w * (sc / 100)
-                elif sig == 'bearish': bear += w * (sc / 100)
-            total = bull + bear
-            bp = (bull / total * 100) if total > 0 else 50
-            sp = (bear / total * 100) if total > 0 else 50
-            diff = bp - sp
-            if diff > 15:
-                return {'direction': 'BUY', 'strength': min(100, 50 + abs(diff)), 'confidence': 'high' if diff > 30 else 'medium', 'bullish_pct': bp, 'bearish_pct': sp, 'results': results}
-            if diff < -15:
-                return {'direction': 'SELL', 'strength': min(100, 50 + abs(diff)), 'confidence': 'high' if diff < -30 else 'medium', 'bullish_pct': bp, 'bearish_pct': sp, 'results': results}
-            return {'direction': 'WAIT', 'strength': 50, 'confidence': 'low', 'bullish_pct': bp, 'bearish_pct': sp, 'results': results}
-        except Exception as e:
-            logger.error(f"خطا در موتور پیشرفته: {e}", exc_info=True)
-            return {'direction': 'WAIT', 'strength': 0, 'confidence': 'low', 'error': str(e)}
-
-    def _aggregate_classic(self, classic_signals):
-        bull = sum(1 for v in classic_signals.values() if isinstance(v, dict) and v.get('signal') == 'bullish')
-        bear = sum(1 for v in classic_signals.values() if isinstance(v, dict) and v.get('signal') == 'bearish')
-        return 'bullish' if bull > bear else 'bearish' if bear > bull else 'neutral'
+            if len(df) < EMA_SLOW:
+                return 'neutral'
+            price = df['close'].iloc[-1]
+            ema21 = df['close'].ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]
+            ema50 = df['close'].ewm(span=EMA_MID, adjust=False).mean().iloc[-1]
+            ema200 = df['close'].ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1]
+            bull = (price > ema200) + (ema21 > ema50) + (ema50 > ema200)
+            bear = (price < ema200) + (ema21 < ema50) + (ema50 < ema200)
+            if bull >= 3: return 'bullish'
+            if bear >= 3: return 'bearish'
+            if bull > bear: return 'bullish'
+            if bear > bull: return 'bearish'
+            return 'neutral'
+        except:
+            return 'neutral'
 
 
 # ============================================================
-# Signal Engine
+# Signal Engine - ترکیب همه لایه‌ها
 # ============================================================
 class SignalEngine:
+    """
+    موتور سیگنال - استراتژی واقعی
+
+    3 حالت ترید:
+    1. Continuation (در جهت روند)
+    2. Reversal (برخلاف روند، وقتی CHoCH هست)
+    3. Range (در رنج، خرید از کف، فروش از سقف)
+    """
+
     def __init__(self):
         self.fetcher = DataFetcher()
-        self.indicators = IndicatorsEngine()
-        self.advanced = AdvancedAnalysisEngine()
-
-    def get_trend_direction(self, df):
-        if len(df) < EMA_SLOW or 'ema_200' not in df.columns:
-            return {"signal": "neutral", "score": 50, "description": "داده کافی نیست"}
-        price = df['close'].iloc[-1]
-        e21, e50, e200 = df['ema_21'].iloc[-1], df['ema_50'].iloc[-1], df['ema_200'].iloc[-1]
-        bull = bear = 0
-        if price > e200: bull += 1
-        else: bear += 1
-        if e21 > e50: bull += 1
-        else: bear += 1
-        if e50 > e200: bull += 1
-        else: bear += 1
-        if bull > bear: return {"signal": "bullish", "score": 70, "description": f"روند صعودی ({bull}/3)"}
-        if bear > bull: return {"signal": "bearish", "score": 70, "description": f"روند نزولی ({bear}/3)"}
-        return {"signal": "neutral", "score": 50, "description": "روند خنثی"}
-
-    def get_rsi_signal(self, df):
-        if 'rsi' not in df.columns: return {"signal": "neutral", "score": 50}
-        rsi = df['rsi'].iloc[-1]
-        if pd.isna(rsi): return {"signal": "neutral", "score": 50}
-        if rsi < RSI_OVERSOLD: return {"signal": "bullish", "score": 80, "description": f"RSI: {rsi:.1f} - اشباع فروش"}
-        if rsi > RSI_OVERBOUGHT: return {"signal": "bearish", "score": 80, "description": f"RSI: {rsi:.1f} - اشباع خرید"}
-        return {"signal": "neutral", "score": 50, "description": f"RSI: {rsi:.1f}"}
-
-    def get_macd_signal(self, df):
-        if 'macd' not in df.columns: return {"signal": "neutral", "score": 50}
-        mv, sv = df['macd'].iloc[-1], df['macd_signal'].iloc[-1]
-        if pd.isna(mv) or pd.isna(sv): return {"signal": "neutral", "score": 50}
-        if mv > sv: return {"signal": "bullish", "score": 65, "description": "MACD: صعودی"}
-        if mv < sv: return {"signal": "bearish", "score": 65, "description": "MACD: نزولی"}
-        return {"signal": "neutral", "score": 50, "description": "MACD: خنثی"}
+        self.context = MarketContextAnalyzer()
+        self.pattern = PatternAnalyzer()
+        self.trigger = TriggerAnalyzer()
 
     def analyze(self):
         try:
-            df = self.fetcher.fetch_ohlc(PRIMARY_TIMEFRAME, count=CANDLE_COUNT)
-            if df.empty or len(df) < 50:
-                return None
-            df = self.indicators.calculate_all(df)
-            cp = float(df['close'].iloc[-1])
+            print("\n📊 لایه 1: Context (Daily)...")
+            context = self.context.analyze()
+            print(f"   {context['description']}")
 
-            classic_signals = {
-                "trend": self.get_trend_direction(df),
-                "rsi": self.get_rsi_signal(df),
-                "macd": self.get_macd_signal(df),
-            }
+            print("\n📊 لایه 2: Pattern (1H)...")
+            pattern = self.pattern.analyze()
+            print(f"   {pattern['description']}")
 
-            advanced_result = self.advanced.analyze(df, classic_signals)
+            print("\n📊 لایه 3: Trigger (15m)...")
+            trigger = self.trigger.analyze()
+            print(f"   {trigger['description']}")
 
-            signal = {
-                'direction': advanced_result['direction'],
-                'strength': advanced_result['strength'],
-                'confidence': advanced_result.get('confidence', 'low'),
-                'bullish_pct': advanced_result.get('bullish_pct', 50),
-                'bearish_pct': advanced_result.get('bearish_pct', 50),
-                'entry_price': cp,
-                'timestamp': datetime.now().isoformat(),
-                'timeframe': PRIMARY_TIMEFRAME,
-                'results': advanced_result.get('results', {}),
-                'classic': classic_signals,
-            }
+            # محاسبه امتیاز کلی
+            cp = trigger.get('current_price', 0)
+            bull_score = 0
+            bear_score = 0
+
+            # 1. Context (وزن 30%)
+            if context['trend'] == 'bullish':
+                bull_score += context['strength'] * 0.30
+            elif context['trend'] == 'bearish':
+                bear_score += context['strength'] * 0.30
+            elif context['trend'] == 'range':
+                # در رنج، بررسی موقعیت قیمت
+                if 'range_high' in context and 'range_low' in context:
+                    range_high = context['range_high']
+                    range_low = context['range_low']
+                    # اگر نزدیک کف هست - خرید
+                    if cp < range_low * 1.001:
+                        bull_score += 50 * 0.30
+                    # اگر نزدیک سقف هست - فروش
+                    elif cp > range_high * 0.999:
+                        bear_score += 50 * 0.30
+
+            # 2. Pattern Structure (وزن 35%)
+            structure = pattern.get('structure', {})
+            struct_dir = structure.get('direction', 'neutral')
+            if struct_dir == 'bullish':
+                # BOS یا CHoCH صعودی
+                bull_score += 80 * 0.35
+                if structure.get('choch') == 'bullish':
+                    # ریورسال - امتیاز بیشتر
+                    bull_score += 20 * 0.35
+            elif struct_dir == 'bearish':
+                bear_score += 80 * 0.35
+                if structure.get('choch') == 'bearish':
+                    bear_score += 20 * 0.35
+
+            # Liquidity Sweep
+            liq = pattern.get('liquidity_sweep', {})
+            if liq.get('detected'):
+                if liq.get('type') == 'bullish':
+                    bull_score += 70 * 0.15
+                elif liq.get('type') == 'bearish':
+                    bear_score += 70 * 0.15
+
+            # 3. Trigger (وزن 35%)
+            trig_dir = trigger.get('direction', 'neutral')
+            trig_strength = trigger.get('strength', 0)
+            if trig_dir == 'bullish':
+                bull_score += trig_strength * 0.35
+            elif trig_dir == 'bearish':
+                bear_score += trig_strength * 0.35
+
+            # محاسبه نهایی
+            total = bull_score + bear_score
+            if total > 0:
+                bull_pct = (bull_score / total) * 100
+                bear_pct = (bear_score / total) * 100
+            else:
+                bull_pct = bear_pct = 50
+
+            diff = bull_pct - bear_pct
+
+            # تصمیم‌گیری
+            if diff > 15:
+                direction = 'BUY'
+                strength = min(100, 50 + abs(diff))
+            elif diff < -15:
+                direction = 'SELL'
+                strength = min(100, 50 + abs(diff))
+            else:
+                direction = 'WAIT'
+                strength = 50 - abs(diff)
+
+            # تعیین نوع ورود
+            entry_type = None
+            entry_price = cp
+            nearest_zone = None
+
+            if direction != 'WAIT':
+                # پیدا کردن نزدیک‌ترین ناحیه مناسب
+                zones = pattern.get('all_zones', [])
+                if direction == 'BUY':
+                    # برای خرید، ناحیه demand زیر قیمت
+                    suitable_zones = [z for z in zones if z['type'] == 'demand' and z['price'] < cp]
+                else:
+                    # برای فروش، ناحیه supply بالای قیمت
+                    suitable_zones = [z for z in zones if z['type'] == 'supply' and z['price'] > cp]
+
+                if suitable_zones:
+                    nearest_zone = min(suitable_zones, key=lambda x: abs(x['price'] - cp))
+                    distance_pct = abs(nearest_zone['price'] - cp) / cp * 100
+
+                    if distance_pct < 0.15:
+                        # قیمت در ناحیه هست - ورود مارکت
+                        entry_type = 'market'
+                        entry_price = cp
+                    else:
+                        # منتظر رسیدن به ناحیه - ورود لیمیت
+                        entry_type = 'limit'
+                        entry_price = nearest_zone['price']
 
             # محاسبه SL/TP
-            atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else cp * 0.002
-            if pd.isna(atr_val) or atr_val == 0:
-                atr_val = cp * 0.002
+            atr_val = self._calc_atr()
+            stop_loss = tp1 = tp2 = tp3 = None
+            if direction != 'WAIT':
+                if direction == 'BUY':
+                    stop_loss = entry_price - (atr_val * ATR_SL_MULTIPLIER)
+                    risk = entry_price - stop_loss
+                    tp1 = entry_price + risk * 1.0
+                    tp2 = entry_price + risk * 2.0
+                    tp3 = entry_price + risk * 3.0
+                else:
+                    stop_loss = entry_price + (atr_val * ATR_SL_MULTIPLIER)
+                    risk = stop_loss - entry_price
+                    tp1 = entry_price - risk * 1.0
+                    tp2 = entry_price - risk * 2.0
+                    tp3 = entry_price - risk * 3.0
 
-            if signal['direction'] == 'BUY':
-                signal['stop_loss'] = cp - (atr_val * ATR_SL_MULTIPLIER)
-                risk = cp - signal['stop_loss']
-                signal['tp1'] = cp + risk
-                signal['tp2'] = cp + risk * 2
-                signal['tp3'] = cp + risk * 3
-            elif signal['direction'] == 'SELL':
-                signal['stop_loss'] = cp + (atr_val * ATR_SL_MULTIPLIER)
-                risk = signal['stop_loss'] - cp
-                signal['tp1'] = cp - risk
-                signal['tp2'] = cp - risk * 2
-                signal['tp3'] = cp - risk * 3
+            # توضیح دلیل
+            reasons = []
+            if context['trend'] != 'unknown':
+                reasons.append(f"Context: {context['trend']}")
+            if struct_dir != 'neutral':
+                reasons.append(f"Structure: {structure.get('description', '')}")
+            if liq.get('detected'):
+                reasons.append(f"Liquidity: {liq.get('description', '')}")
+            if trigger.get('patterns'):
+                reasons.append(f"Trigger: {len(trigger['patterns'])} الگو")
+            if entry_type:
+                reasons.append(f"Entry: {entry_type}")
+            reason = " | ".join(reasons) if reasons else "تحلیل انجام شد"
 
-            return signal
-
+            return {
+                'direction': direction,
+                'strength': strength,
+                'confidence': 'high' if strength >= 75 else 'medium' if strength >= 60 else 'low',
+                'bull_pct': bull_pct,
+                'bear_pct': bear_pct,
+                'diff': diff,
+                'entry_type': entry_type,
+                'entry_price': entry_price,
+                'current_price': cp,
+                'stop_loss': stop_loss,
+                'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
+                'risk_reward': 3.0,
+                'timestamp': datetime.now().isoformat(),
+                'context': context,
+                'pattern': pattern,
+                'trigger': trigger,
+                'nearest_zone': nearest_zone,
+                'reason': reason,
+            }
         except Exception as e:
             logger.error(f"خطا در تحلیل: {e}", exc_info=True)
             return None
 
+    def _calc_atr(self):
+        try:
+            df = self.fetcher.fetch_closed_candles(TF_TRIGGER, count=50)
+            hl = df['high'] - df['low']
+            hc = (df['high'] - df['close'].shift()).abs()
+            lc = (df['low'] - df['close'].shift()).abs()
+            tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+            atr = tr.ewm(alpha=1/ATR_PERIOD, adjust=False).mean().iloc[-1]
+            if pd.isna(atr) or atr == 0:
+                atr = df['close'].iloc[-1] * 0.002
+            return float(atr)
+        except:
+            return 0.3
+
 
 # ============================================================
-# Signal State Manager
+# AI Decision Maker (تصمیم‌گیرنده، نه فقط تحلیلگر)
 # ============================================================
-class SignalStateManager:
-    """مدیریت وضعیت سیگنال بین اجراها"""
+class AIDecisionMaker:
+    """AI برای تأیید نهایی سیگنال"""
 
     def __init__(self):
-        self.state_file = SIGNAL_STATE_FILE
+        self.enabled = bool(ZAI_API_KEY)
+        self.api_key = ZAI_API_KEY
 
-    def load_state(self):
-        """بارگذاری وضعیت قبلی"""
-        try:
-            if os.path.exists(self.state_file):
-                with open(self.state_file, 'r') as f:
-                    return json.load(f)
-        except:
-            pass
-        return {'last_signal_direction': None, 'last_signal_time': None, 'last_signal_strength': 0}
+    def review_signal(self, signal):
+        """بررسی سیگنال توسط AI و تأیید/رد"""
+        if not self.enabled:
+            return {'approved': True, 'reason': 'AI غیرفعال', 'analysis': None}
 
-    def save_state(self, state):
-        """ذخیره وضعیت"""
         try:
-            with open(self.state_file, 'w') as f:
-                json.dump(state, f, indent=2)
+            context = signal.get('context', {})
+            pattern = signal.get('pattern', {})
+            trigger = signal.get('trigger', {})
+
+            prompt = f"""
+شما یک تریدر حرفه‌ای بانک هستید. این سیگنال USD/JPY را بررسی کنید:
+
+سیگنال: {signal['direction']} (قدرت: {signal['strength']:.0f}%)
+قیمت فعلی: {signal.get('current_price', 0):.3f}
+
+Context (Daily):
+- روند: {context.get('trend', 'unknown')}
+- {context.get('description', '')}
+
+Pattern (1H):
+- {pattern.get('description', '')}
+- ساختار: {pattern.get('structure', {}).get('description', 'نامشخص')}
+- Liquidity Sweep: {pattern.get('liquidity_sweep', {}).get('detected', False)}
+
+Trigger (15m):
+- {trigger.get('description', '')}
+- الگوها: {len(trigger.get('patterns', []))}
+
+ناحیه ورود: {signal.get('nearest_zone', {}).get('source', 'نامشخص') if signal.get('nearest_zone') else 'نامشخص'}
+نوع ورود: {signal.get('entry_type', 'نامشخص')}
+
+سوالات:
+1. آیا با این سیگنال موافقی؟ (بله/خیر)
+2. اگر خیر، چرا؟
+3. نقاط قوت سیگنال چیست؟
+4. ریسک‌ها چیست؟
+5. توصیه نهایی (یک جمله)
+
+پاسخ را در قالب JSON زیر بده:
+{{
+  "approved": true/false,
+  "reason": "دلیل کوتاه",
+  "strengths": "نقاط قوت",
+  "risks": "ریسک‌ها",
+  "recommendation": "توصیه"
+}}
+"""
+            response = requests.post(
+                "https://api.z.ai/api/paas/v4/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                json={"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 500},
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                # تلاش برای parse JSON
+                try:
+                    # پیدا کردن JSON در متن
+                    start = content.find('{')
+                    end = content.rfind('}') + 1
+                    if start >= 0 and end > start:
+                        result = json.loads(content[start:end])
+                        return {
+                            'approved': result.get('approved', True),
+                            'reason': result.get('reason', ''),
+                            'strengths': result.get('strengths', ''),
+                            'risks': result.get('risks', ''),
+                            'recommendation': result.get('recommendation', ''),
+                            'analysis': content,
+                        }
+                except:
+                    pass
+                return {'approved': True, 'reason': 'AI بررسی کرد اما فرمت نامشخص', 'analysis': content}
+            return {'approved': True, 'reason': 'خطا در API', 'analysis': None}
         except Exception as e:
-            logger.error(f"خطا در ذخیره وضعیت: {e}")
-
-    def should_send_signal(self, signal):
-        """بررسی آیا سیگنال باید ارسال شود"""
-        state = self.load_state()
-        # همیشه ارسال کن (برای تست)
-        # در نسخه اصلی فقط در صورت تغییر جهت یا افزایش قدرت
-        return True
+            logger.error(f"خطا در AI: {e}")
+            return {'approved': True, 'reason': f'خطا: {e}', 'analysis': None}
 
 
 # ============================================================
-# Telegram Sender
+# Stats Manager
+# ============================================================
+class StatsManager:
+    def __init__(self):
+        self.signals_db = SIGNALS_DB_FILE
+
+    def load_signals(self):
+        try:
+            if os.path.exists(self.signals_db):
+                with open(self.signals_db, 'r') as f:
+                    return json.load(f)
+        except: pass
+        return []
+
+    def save_signal(self, signal):
+        signals = self.load_signals()
+        minimal = {
+            'direction': signal['direction'],
+            'strength': signal.get('strength', 0),
+            'entry_type': signal.get('entry_type'),
+            'price': signal.get('current_price'),
+            'timestamp': signal['timestamp'],
+        }
+        signals.append(minimal)
+        if len(signals) > 500:
+            signals = signals[-500:]
+        try:
+            with open(self.signals_db, 'w') as f:
+                json.dump(signals, f, indent=2)
+        except: pass
+
+
+# ============================================================
+# Telegram
 # ============================================================
 def send_telegram_message(message):
-    """ارسال پیام به تلگرام"""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
         response = requests.post(url, data=data, timeout=30)
-        if response.status_code == 200:
-            logger.info("✓ پیام تلگرام ارسال شد")
-            return True
-        else:
-            logger.error(f"خطا در ارسال تلگرام: {response.status_code} - {response.text}")
-            return False
+        return response.status_code == 200
     except Exception as e:
-        logger.error(f"خطا در ارسال تلگرام: {e}")
+        logger.error(f"خطا: {e}")
         return False
 
 
-def format_signal_message(signal):
-    """فرمت‌بندی سیگنال به پیام تلگرام"""
-    if signal['direction'] == 'BUY':
-        icon, dir_fa, arr = "🟢", "خرید", "▲"
-    elif signal['direction'] == 'SELL':
-        icon, dir_fa, arr = "🔴", "فروش", "▼"
+def format_signal_message(signal, ai_review=None):
+    direction = signal['direction']
+    if direction == 'BUY':
+        icon, dir_fa = "🟢", "خرید"
+    elif direction == 'SELL':
+        icon, dir_fa = "🔴", "فروش"
     else:
-        icon, dir_fa, arr = "⏳", "صبر", "●"
+        icon, dir_fa = "⏳", "صبر"
 
-    conf_icon = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(signal['confidence'], "⚪")
+    conf_icon = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(signal.get('confidence', 'low'), "⚪")
 
     msg = f"{icon} سیگنال {dir_fa} USD/JPY\n"
-    msg += f"جهت: {arr} {signal['direction']}\n"
     msg += f"{'='*30}\n\n"
-    msg += f"💰 قیمت فعلی: {signal['entry_price']:.3f}\n"
-    msg += f"💪 قدرت: {signal['strength']:.0f}%\n"
-    msg += f"{conf_icon} اطمینان: {signal['confidence']}\n"
-    msg += f"📈 صعودی: {signal['bullish_pct']:.0f}% | 📉 نزولی: {signal['bearish_pct']:.0f}%\n"
-    msg += f"⏰ تایم‌فریم: {signal['timeframe']}\n"
+
+    msg += f"💰 قیمت فعلی: {signal.get('current_price', 0):.3f}\n"
+    if direction in ['BUY', 'SELL']:
+        entry_type = signal.get('entry_type', 'market')
+        entry_icon = "⚡" if entry_type == 'market' else "📋"
+        msg += f"{entry_icon} نوع ورود: {entry_type.upper()}\n"
+        msg += f"🔹 نقطه ورود: {signal.get('entry_price', 0):.3f}\n"
+    msg += f"💪 قدرت: {signal.get('strength', 0):.0f}%\n"
+    msg += f"{conf_icon} اطمینان: {signal.get('confidence', 'low')}\n"
+    msg += f"📈 صعودی: {signal.get('bull_pct', 50):.0f}% | 📉 نزولی: {signal.get('bear_pct', 50):.0f}%\n"
     msg += f"🕐 زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
 
-    if signal['direction'] in ['BUY', 'SELL']:
+    # Context
+    context = signal.get('context', {})
+    msg += "📊 Context (Daily):\n"
+    msg += "-"*30 + "\n"
+    msg += f"• {context.get('description', 'نامشخص')}\n"
+    if context.get('is_range'):
+        msg += f"• بازار در حالت رنج\n"
+    msg += "\n"
+
+    # Pattern
+    pattern = signal.get('pattern', {})
+    msg += "📊 Pattern (1H):\n"
+    msg += "-"*30 + "\n"
+    msg += f"• {pattern.get('description', 'نامشخص')}\n"
+    structure = pattern.get('structure', {})
+    msg += f"• ساختار: {structure.get('description', 'نامشخص')}\n"
+
+    liq = pattern.get('liquidity_sweep', {})
+    if liq.get('detected'):
+        msg += f"• {liq.get('description', '')}\n"
+
+    nz = signal.get('nearest_zone')
+    if nz:
+        msg += f"• ناحیه فعال: {nz.get('source', '?')} ({nz.get('type', '?')}) - {nz.get('price', 0):.3f}\n"
+    msg += "\n"
+
+    # Trigger
+    trigger = signal.get('trigger', {})
+    msg += "📊 Trigger (15m):\n"
+    msg += "-"*30 + "\n"
+    msg += f"• {trigger.get('description', 'نامشخص')}\n"
+
+    patterns = trigger.get('patterns', [])
+    if patterns:
+        msg += "الگوها:\n"
+        for p in patterns:
+            ic = "🟢" if p['type'] == 'bullish' else "🔴" if p['type'] == 'bearish' else "⚪"
+            msg += f"  {ic} {p['name']} ({p['strength']}%)\n"
+    msg += "\n"
+
+    if direction in ['BUY', 'SELL']:
         msg += "📌 مشخصات معامله:\n"
-        msg += f"🔹 ورود: {signal['entry_price']:.3f}\n"
-        if 'stop_loss' in signal:
-            msg += f"🛑 حد ضرر: {signal['stop_loss']:.3f} ({abs(signal['entry_price']-signal['stop_loss'])*100:.1f} پیپ)\n"
-        if 'tp1' in signal:
-            msg += f"🎯 حد سود 1: {signal['tp1']:.3f}\n"
-        if 'tp2' in signal:
-            msg += f"🎯 حد سود 2: {signal['tp2']:.3f}\n"
-        if 'tp3' in signal:
-            msg += f"🎯 حد سود 3: {signal['tp3']:.3f}\n"
+        msg += "-"*30 + "\n"
+        if signal.get('stop_loss'):
+            msg += f"🛑 حد ضرر: {signal['stop_loss']:.3f} ({abs(signal.get('entry_price', 0) - signal['stop_loss'])*100:.1f} پیپ)\n"
+        if signal.get('tp1'):
+            msg += f"🎯 TP1: {signal['tp1']:.3f}\n"
+        if signal.get('tp2'):
+            msg += f"🎯 TP2: {signal['tp2']:.3f}\n"
+        if signal.get('tp3'):
+            msg += f"🎯 TP3: {signal['tp3']:.3f}\n"
+        msg += f"⚖️ ریسک/ریوارد: 1:3\n\n"
+
+    # AI Review
+    if ai_review and ai_review.get('analysis'):
+        msg += "🤖 تحلیل AI:\n"
+        msg += "-"*30 + "\n"
+        if ai_review.get('approved'):
+            msg += f"✅ تأیید AI: {ai_review.get('reason', '')}\n"
+        else:
+            msg += f"⚠️ هشدار AI: {ai_review.get('reason', '')}\n"
+        if ai_review.get('recommendation'):
+            msg += f"💡 توصیه: {ai_review.get('recommendation', '')}\n"
         msg += "\n"
 
-        # تحلیل پیشرفته
-        results = signal.get('results', {})
-        msg += "🧠 تحلیل پیشرفته:\n"
-        msg += "-"*30 + "\n"
-        for method_name in ['smc', 'structure', 'price_action']:
-            if method_name in results:
-                res = results[method_name]
-                if isinstance(res, dict):
-                    s = res.get("signal", "neutral")
-                    d = res.get("description", "")
-                    ic = "✅" if s == "bullish" else "❌" if s == "bearish" else "➖"
-                    msg += f"{ic} {d}\n"
-
-        # الگوهای کندلی
-        pa = results.get('price_action', {})
-        patterns = pa.get('patterns', []) if isinstance(pa, dict) else []
-        if patterns:
-            msg += "\n🕯 الگوهای کندلی:\n"
-            msg += "-"*30 + "\n"
-            for p in patterns:
-                ic = "🟢" if p["type"] == "bullish" else "🔴" if p["type"] == "bearish" else "⚪"
-                msg += f"{ic} {p['name_fa']}\n"
-    else:
-        msg += "📋 وضعیت فعلی:\n"
-        msg += "-"*30 + "\n"
-        results = signal.get('results', {})
-        for method_name in ['smc', 'structure', 'price_action']:
-            if method_name in results:
-                res = results[method_name]
-                if isinstance(res, dict):
-                    msg += f"➖ {res.get('description', '')}\n"
-
+    msg += f"💡 دلیل: {signal.get('reason', '')}\n"
     msg += f"\n{'='*30}\n"
-    msg += "⚠️ این سیگنال صرفاً جنبه تحلیلی دارد."
+    msg += "⚠️ این سیگنال صرفاً تحلیلی است.\n"
+    msg += "🎯 حداقل 1 سیگنال روزانه دریافت می‌کنید."
     return msg
 
 
@@ -620,58 +970,52 @@ def format_signal_message(signal):
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 ربات سیگنال‌دهی USD/JPY - GitHub Actions")
+    print("🤖 ربات سیگنال USD/JPY - استراتژی واقعی")
     print("=" * 60)
 
-    if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN تنظیم نشده!")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ تنظیمات تلگرام ناقص!")
         sys.exit(1)
 
-    if not TELEGRAM_CHAT_ID:
-        print("❌ TELEGRAM_CHAT_ID تنظیم نشده!")
-        sys.exit(1)
-
-    print(f"📋 توکن: {TELEGRAM_BOT_TOKEN[:15]}...")
-    print(f"👤 چت ID: {TELEGRAM_CHAT_ID}")
     print(f"📊 نماد: {SYMBOL_DISPLAY}")
+    print(f"🏗 Context: Daily")
+    print(f"📐 Pattern: 1H")
+    print(f"🎯 Trigger: 15m")
+    print(f"🤖 AI: {'فعال' if ZAI_API_KEY else 'غیرفعال'}")
     print(f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # تحلیل بازار
-    print("\n🔍 در حال تحلیل بازار...")
     engine = SignalEngine()
     signal = engine.analyze()
 
     if not signal:
-        print("❌ خطا در تحلیل")
-        send_telegram_message("❌ خطا در تحلیل بازار. لطفاً بعداً تلاش کنید.")
+        send_telegram_message("❌ خطا در تحلیل بازار.")
         return
 
-    print(f"\n📊 نتیجه تحلیل:")
+    print(f"\n📊 نتیجه:")
     print(f"جهت: {signal['direction']}")
-    print(f"قدرت: {signal['strength']:.0f}%")
-    print(f"اطمینان: {signal['confidence']}")
-    print(f"صعودی: {signal['bullish_pct']:.0f}% | نزولی: {signal['bearish_pct']:.0f}%")
+    print(f"قدرت: {signal.get('strength', 0):.0f}%")
+    print(f"دلیل: {signal.get('reason', '')}")
 
-    # بررسی وضعیت سیگنال قبلی
-    state_manager = SignalStateManager()
-    should_send = state_manager.should_send_signal(signal)
+    # ذخیره
+    stats = StatsManager()
+    stats.save_signal(signal)
 
-    if should_send:
-        msg = format_signal_message(signal)
-        print("\n📱 ارسال به تلگرام...")
-        success = send_telegram_message(msg)
-        if success:
-            print("✅ سیگنال ارسال شد!")
-            # ذخیره وضعیت
-            state_manager.save_state({
-                'last_signal_direction': signal['direction'],
-                'last_signal_time': signal['timestamp'],
-                'last_signal_strength': signal['strength'],
-            })
-        else:
-            print("❌ خطا در ارسال")
+    # بررسی AI
+    ai_review = None
+    if ZAI_API_KEY:
+        print("\n🤖 بررسی توسط AI...")
+        ai_decision = AIDecisionMaker()
+        ai_review = ai_decision.review_signal(signal)
+        if ai_review:
+            print(f"✓ AI تأیید کرد: {ai_review.get('approved')}")
+
+    # ارسال
+    print("\n📱 ارسال به تلگرام...")
+    msg = format_signal_message(signal, ai_review)
+    if send_telegram_message(msg):
+        print("✅ ارسال شد!")
     else:
-        print("⏸ سیگنال جدیدی نیست (تکراری)")
+        print("❌ خطا در ارسال")
 
 
 if __name__ == "__main__":
