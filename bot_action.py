@@ -28,10 +28,28 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 # ============================================================
+# نصب خودکار وابستگی‌ها (فقط در صورت نیاز)
+# ============================================================
 def install_dependencies():
-    deps = ["yfinance", "pandas", "numpy", "requests", "python-dotenv"]
-    for dep in deps:
-        os.system(f'pip install {dep} --quiet')
+    try:
+        import yfinance
+        import pandas
+        import numpy
+        import requests
+        from dotenv import load_dotenv
+        print("✅ وابستگی‌ها موجودند")
+        return True
+    except ImportError:
+        print("📦 در حال نصب وابستگی‌ها...")
+        deps = ["yfinance", "pandas", "numpy", "requests", "python-dotenv"]
+        for dep in deps:
+            ret = os.system(f'pip install {dep} --quiet 2>&1')
+            if ret != 0:
+                ret = os.system(f'pip3 install {dep} --quiet 2>&1')
+                if ret != 0:
+                    os.system(f'python -m pip install {dep} --quiet 2>&1')
+        print("✅ نصب کامل شد")
+        return True
 
 install_dependencies()
 
@@ -43,6 +61,8 @@ try:
     from dotenv import load_dotenv
 except ImportError as e:
     print(f"❌ خطا در ایمپورت: {e}")
+    print("لطفاً دستور زیر را اجرا کنید:")
+    print("pip install yfinance pandas numpy requests python-dotenv")
     sys.exit(1)
 
 load_dotenv()
