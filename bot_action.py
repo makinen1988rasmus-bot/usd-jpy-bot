@@ -1242,31 +1242,46 @@ def main():
     try:
         print("\n📊 مانیتورینگ پوزیشن (جداگانه)...")
         import subprocess
+        import sys as _sys
 
         # ذخیره سیگنال در فایل موقت برای position_tracker
         signal_file = "last_signal.json"
         try:
             with open(signal_file, 'w', encoding='utf-8') as f:
                 json.dump(signal, f, indent=2, ensure_ascii=False, default=str)
-        except:
-            pass
+            print(f"  ✓ سیگنال در {signal_file} ذخیره شد")
+        except Exception as e:
+            print(f"  ⚠️ خطا در ذخیره سیگنال: {e}")
 
-        # اجرای position_tracker.py به‌عنوان پروسه جداگانه
-        result = subprocess.run(
-            ['python', 'position_tracker.py'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-
-        if result.returncode == 0:
-            print("✓ مانیتورینگ کامل شد")
-            if result.stdout:
-                # نمایش خروجی
-                for line in result.stdout.strip().split('\n')[-5:]:
-                    print(f"  {line}")
+        # بررسی وجود position_tracker.py
+        if not os.path.exists('position_tracker.py'):
+            print("  ⚠️ position_tracker.py موجود نیست! آپلودش کنی!")
         else:
-            print(f"⚠️ position_tracker خطا داد: {result.stderr[:100]}")
+            # اجرای position_tracker.py به‌عنوان پروسه جداگانه
+            # استفاده از مسیر پایتون فعلی برای اطمینان
+            python_exe = _sys.executable
+            print(f"  📍 استفاده از: {python_exe}")
+
+            result = subprocess.run(
+                [python_exe, 'position_tracker.py'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ}  # انتقال متغیرهای محیطی
+            )
+
+            if result.returncode == 0:
+                print("  ✓ مانیتورینگ کامل شد")
+                if result.stdout:
+                    lines = result.stdout.strip().split('\n')
+                    for line in lines[-10:]:
+                        print(f"  {line}")
+            else:
+                print(f"  ⚠️ position_tracker خطا داد:")
+                if result.stderr:
+                    print(f"  خطا: {result.stderr[:200]}")
+                if result.stdout:
+                    print(f"  خروجی: {result.stdout[:200]}")
 
     except Exception as e:
         print(f"⚠️ خطا در مانیتورینگ (ربات اصلی ادامه می‌ده): {e}")
