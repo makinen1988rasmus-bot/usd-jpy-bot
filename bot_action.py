@@ -896,6 +896,37 @@ class SignalEngine:
                 entry_reason = f"بازار بسته - {entry_reason}"
 
             # ============================================
+            # فیلتر تأیید جهت (منطق هوشمند)
+            # اگه تریگر قوی و برخلاف سیگنال باشه → ریورسال به جهت تریگر
+            # ============================================
+            if direction != 'WAIT':
+                trig_dir = trigger.get('direction', 'neutral')
+                trig_strength = trigger.get('strength', 0)
+
+                # تبدیل جهت سیگنال به bullish/bearish
+                signal_dir = 'bullish' if direction == 'BUY' else 'bearish'
+
+                # بررسی تناقض
+                if trig_dir != 'neutral' and trig_dir != signal_dir:
+                    # تریگر برخلاف سیگنال هست
+                    # اگه تریگر قوی باشه (≥60%)، سیگنال رو به جهت تریگر تغییر بده (ریورسال)
+                    if trig_strength >= 60:
+                        old_direction = direction
+                        direction = 'BUY' if trig_dir == 'bullish' else 'SELL'
+                        entry_type = 'market'
+                        entry_price = cp
+                        # قدرت جدید بر اساس قدرت تریگر
+                        strength = max(65, trig_strength)
+                        entry_reason = f"🔄 ریورسال: تریگر قوی {trig_dir} ({trig_strength:.0f}%) - سیگنال از {old_direction} به {direction} تغییر کرد"
+                        setup_type = "Reversal (Trigger)"
+                        print(f"   🔄 Reversal: {old_direction} → {direction} (trigger {trig_dir} {trig_strength:.0f}%)")
+                    # اگه تریگر ضعیف باشه، سیگنال رو نگه دار ولی هشدار بده
+                    else:
+                        strength = max(40, strength - 15)
+                        entry_reason += f" | ⚠️ تریگر برخلاف ({trig_dir} ضعیف)"
+                        print(f"   ⚠️ Weak conflict: trigger={trig_dir} ({trig_strength:.0f}%)")
+
+            # ============================================
             # محاسبه SL/TP با buffer مناسب
             # ============================================
             atr_val = self._calc_atr()
@@ -1203,6 +1234,42 @@ def main():
         print("✅ ارسال شد!")
     else:
         print("❌ خطا در ارسال")
+
+    # ============================================
+    # مانیتورینگ پوزیشن و کارنامه هفتگی
+    # این بخش کاملاً جدا اجرا می‌شه - اگه خراب شه، ربات اصلی کار می‌کنه
+    # ============================================
+    try:
+        print("\n📊 مانیتورینگ پوزیشن (جداگانه)...")
+        import subprocess
+
+        # ذخیره سیگنال در فایل موقت برای position_tracker
+        signal_file = "last_signal.json"
+        try:
+            with open(signal_file, 'w', encoding='utf-8') as f:
+                json.dump(signal, f, indent=2, ensure_ascii=False, default=str)
+        except:
+            pass
+
+        # اجرای position_tracker.py به‌عنوان پروسه جداگانه
+        result = subprocess.run(
+            ['python', 'position_tracker.py'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            print("✓ مانیتورینگ کامل شد")
+            if result.stdout:
+                # نمایش خروجی
+                for line in result.stdout.strip().split('\n')[-5:]:
+                    print(f"  {line}")
+        else:
+            print(f"⚠️ position_tracker خطا داد: {result.stderr[:100]}")
+
+    except Exception as e:
+        print(f"⚠️ خطا در مانیتورینگ (ربات اصلی ادامه می‌ده): {e}")
 
 
 if __name__ == "__main__":
