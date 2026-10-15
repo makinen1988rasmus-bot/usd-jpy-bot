@@ -1237,54 +1237,29 @@ def main():
 
     # ============================================
     # مانیتورینگ پوزیشن و کارنامه هفتگی
-    # این بخش کاملاً جدا اجرا می‌شه - اگه خراب شه، ربات اصلی کار می‌کنه
+    # کد جداگانه در position_tracker.py - فراخوانی مستقیم با try/except
+    # اگه خراب شه، ربات اصلی کار می‌کنه
     # ============================================
     try:
-        print("\n📊 مانیتورینگ پوزیشن (جداگانه)...")
-        import subprocess
-        import sys as _sys
+        print("\n📊 مانیتورینگ پوزیشن...")
+        from position_tracker import track_signal
 
-        # ذخیره سیگنال در فایل موقت برای position_tracker
-        signal_file = "last_signal.json"
-        try:
-            with open(signal_file, 'w', encoding='utf-8') as f:
-                json.dump(signal, f, indent=2, ensure_ascii=False, default=str)
-            print(f"  ✓ سیگنال در {signal_file} ذخیره شد")
-        except Exception as e:
-            print(f"  ⚠️ خطا در ذخیره سیگنال: {e}")
+        result = track_signal(signal, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
-        # بررسی وجود position_tracker.py
-        if not os.path.exists('position_tracker.py'):
-            print("  ⚠️ position_tracker.py موجود نیست! آپلودش کنی!")
+        if result.get('success'):
+            print(f"  ✓ مانیتورینگ کامل شد")
+            print(f"  💳 موجودی: ${result.get('balance', 0):.2f}")
+            print(f"  📂 پوزیشن‌های باز: {result.get('open_positions', 0)}")
+            print(f"  📨 پیام‌های ارسالی: {result.get('messages_sent', 0)}")
+            if result.get('report_sent'):
+                print(f"  📊 کارنامه هفتگی ارسال شد!")
         else:
-            # اجرای position_tracker.py به‌عنوان پروسه جداگانه
-            # استفاده از مسیر پایتون فعلی برای اطمینان
-            python_exe = _sys.executable
-            print(f"  📍 استفاده از: {python_exe}")
+            print(f"  ⚠️ خطا: {result.get('error', 'نامشخص')}")
 
-            result = subprocess.run(
-                [python_exe, 'position_tracker.py'],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env={**os.environ}  # انتقال متغیرهای محیطی
-            )
-
-            if result.returncode == 0:
-                print("  ✓ مانیتورینگ کامل شد")
-                if result.stdout:
-                    lines = result.stdout.strip().split('\n')
-                    for line in lines[-10:]:
-                        print(f"  {line}")
-            else:
-                print(f"  ⚠️ position_tracker خطا داد:")
-                if result.stderr:
-                    print(f"  خطا: {result.stderr[:200]}")
-                if result.stdout:
-                    print(f"  خروجی: {result.stdout[:200]}")
-
+    except ImportError:
+        print("  ⚠️ position_tracker.py موجود نیست - آپلودش کنی!")
     except Exception as e:
-        print(f"⚠️ خطا در مانیتورینگ (ربات اصلی ادامه می‌ده): {e}")
+        print(f"  ⚠️ خطا در مانیتورینگ (ربات اصلی ادامه می‌ده): {e}")
 
 
 if __name__ == "__main__":
