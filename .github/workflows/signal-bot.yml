@@ -9,20 +9,40 @@ jobs:
   send_signal:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
+
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install yfinance pandas numpy requests python-dotenv
+
       - name: 🤖 Run Signal Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_ADMIN_IDS: ${{ secrets.TELEGRAM_ADMIN_IDS }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
         run: python bot_action.py
+
+      - name: 💾 Commit trading data
+        if: always()
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add positions_db.json signals_db.json last_signal.json 2>/dev/null || true
+          git commit -m "Update trading data [skip ci]" 2>/dev/null || echo "No changes to commit"
+          git push 2>/dev/null || echo "Push failed or no changes"
