@@ -71,6 +71,8 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
+OANDA_API_KEY = os.getenv("OANDA_API_KEY", "")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
 AI_MODEL = "glm-4.5"
 
 SYMBOL = "JPY=X"
@@ -216,25 +218,81 @@ class SessionDetector:
 
 
 # ============================================================
-# Data Fetcher
+# Data Fetcher (ترکیبی: OANDA + Yahoo Finance fallback)
 # ============================================================
 class DataFetcher:
+    """دریافت داده از OANDA (اصلی) با fallback به Yahoo Finance"""
+
     def __init__(self):
-        self.ticker = yf.Ticker(SYMBOL)
         self._cache = {}
         self._cache_time = {}
+        self.oanda_fetcher = None
+        self.yahoo_ticker = None
+
+        # تلاش برای اتصال به OANDA
+        try:
+            from oanda_data import OandaDataFetcher
+            if OANDA_API_KEY and OANDA_ACCOUNT_ID:
+                self.oanda_fetcher = OandaDataFetcher()
+                logger.info("✓ OANDA متصل شد")
+        except ImportError:
+            logger.warning("oanda_data.py موجود نیست - استفاده از Yahoo Finance")
+
+        # Yahoo Finance به‌عنوان fallback
+        try:
+            self.yahoo_ticker = yf.Ticker(SYMBOL)
+        except:
+            pass
 
     def fetch_closed_candles(self, timeframe, count=300):
+        """فقط کندل‌های بسته‌شده"""
         import time as t
         cache_key = f"{timeframe}_{count}"
         if cache_key in self._cache and cache_key in self._cache_time:
             if t.time() - self._cache_time[cache_key] < 300:
                 return self._cache[cache_key]
 
+        # ============================================
+        # روش 1: تلاش با OANDA (اولویت اول)
+        # ============================================
+        if self.oanda_fetcher:
+            try:
+                # تبدیل تایم‌فریم به فرمت OANDA
+                tf_map = {
+                    "15m": "M15", "1h": "H1", "60m": "H1",
+                    "4h": "H4", "1d": "D", "1wk": "W"
+                }
+                oanda_tf = tf_map.get(timeframe, "M15")
+                df = self.oanda_fetcher.get_ohlc(oanda_tf, count=count)
+
+                if df is not None and not df.empty:
+                    # تبدیل index به ستون time (مثل Yahoo)
+                    df = df.reset_index()
+                    if 'time' in df.columns:
+                        df['datetime'] = pd.to_datetime(df['time'])
+                        df = df.set_index('datetime')
+                        df = df.drop('time', axis=1, errors='ignore')
+                    # اطمینان از ستون‌ها
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        if col not in df.columns:
+                            df[col] = 0
+
+                    self._cache[cache_key] = df
+                    self._cache_time[cache_key] = t.time()
+                    logger.info(f"✓ داده از OANDA دریافت شد: {len(df)} کندل ({timeframe})")
+                    return df
+                else:
+                    logger.warning("OANDA داده خالی برگردوند، fallback به Yahoo")
+            except Exception as e:
+                logger.warning(f"خطا در OANDA، fallback به Yahoo: {e}")
+
+        # ============================================
+        # روش 2: Fallback به Yahoo Finance
+        # ============================================
         try:
             period_map = {"15m": "60d", "1h": "730d", "60m": "730d", "4h": "60d", "1d": "2y", "1wk": "5y"}
             period = period_map.get(timeframe, "60d")
-            df = self.ticker.history(period=period, interval=timeframe, auto_adjust=False, prepost=False)
+            df = self.yahoo_ticker.history(period=period, interval=timeframe, auto_adjust=False, prepost=False)
             if df.empty:
                 df = yf.download(SYMBOL, period=period, interval=timeframe, progress=False, auto_adjust=False)
             if df.empty:
@@ -251,10 +309,31 @@ class DataFetcher:
 
             self._cache[cache_key] = df
             self._cache_time[cache_key] = t.time()
+            logger.info(f"✓ داده از Yahoo دریافت شد: {len(df)} کندل ({timeframe})")
             return df
         except Exception as e:
-            logger.error(f"خطا در دریافت داده {timeframe}: {e}")
+            logger.error(f"خطا در Yahoo Finance: {e}")
             raise
+
+    def get_current_price(self):
+        """قیمت لحظه‌ای - اولویت با OANDA"""
+        # OANDA
+        if self.oanda_fetcher:
+            try:
+                price = self.oanda_fetcher.get_current_price()
+                if price and price > 0:
+                    return price
+            except:
+                pass
+
+        # Yahoo fallback
+        try:
+            df = self.yahoo_ticker.history(period="1d", interval="1m")
+            if not df.empty:
+                return float(df['Close'].iloc[-1])
+        except:
+            pass
+        return None
 
 
 # ============================================================
