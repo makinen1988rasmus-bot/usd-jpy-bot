@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-مانیتورینگ پوزیشن و کارنامه هفتگی
-Position Tracker & Weekly Report
+مانیتورینگ پوزیشن و کارنامه هفتگی - نسخه کامل
+Position Tracker & Weekly Report - Full Version
 
-این فایل کاملاً جدا از bot_action.py هست (در فایل جداگانه)
-اما با import مستقیم فراخوانی می‌شه (مطمئن‌تر از subprocess)
-
-اگه این فایل خطا بده، bot_action.py با try/except ادامه می‌ده
+ویژگی‌ها:
+1. دریافت قیمت لحظه‌ای از OANDA (real-time)
+2. مانیتور پوزیشن‌های باز
+3. چک TP/SL با قیمت واقعی
+4. کارنامه هفتگی خودکار (جمعه‌ها)
+5. مدیریت موجودی واقعی
 
 تنظیمات:
 - موجودی اولیه: 40 دلار
@@ -22,16 +24,60 @@ from datetime import datetime, timedelta, timezone
 # ============================================================
 # Configuration
 # ============================================================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+OANDA_API_KEY = os.getenv("OANDA_API_KEY", "")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
+
 INITIAL_BALANCE = 40.0
 LEVERAGE = 20
 RISK_PER_TRADE = 0.02
 
 POSITIONS_DB_FILE = "positions_db.json"
 
-WEEKLY_REPORT_DAY = 5  # جمعه
+WEEKLY_REPORT_DAY = 4  # جمعه (0=دوشنبه، 4=جمعه)
 WEEKLY_REPORT_HOUR = 20  # 20:00 UTC
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Price Fetcher (از OANDA)
+# ============================================================
+class PriceFetcher:
+    """گرفتن قیمت لحظه‌ای از OANDA"""
+
+    BASE_URL = "https://api-fxpractice.oanda.com/v3"
+    SYMBOL = "USD_JPY"
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {OANDA_API_KEY}",
+            "Content-Type": "application/json",
+        })
+
+    def get_current_price(self):
+        """قیمت لحظه‌ای"""
+        try:
+            if not OANDA_API_KEY:
+                logger.error("OANDA_API_KEY تنظیم نشده")
+                return None
+
+            url = f"{self.BASE_URL}/instruments/{self.SYMBOL}/candles"
+            params = {"count": 1, "granularity": "S5", "price": "M"}
+            response = self.session.get(url, params=params, timeout=15)
+
+            if response.status_code == 200:
+                data = response.json()
+                if "candles" in data and len(data["candles"]) > 0:
+                    return float(data["candles"][-1]["mid"]["c"])
+            else:
+                logger.error(f"OANDA خطا: {response.status_code}")
+        except Exception as e:
+            logger.error(f"خطا در قیمت: {e}")
+        return None
 
 
 # ============================================================
@@ -40,9 +86,8 @@ logger = logging.getLogger(__name__)
 class PositionTracker:
     """مانیتورینگ پوزیشن‌های باز و شبیه‌سازی ترید"""
 
-    def __init__(self, telegram_token, telegram_chat_id):
-        self.token = telegram_token
-        self.chat_id = telegram_chat_id
+    def __init__(self):
+        self.price_fetcher = PriceFetcher()
         self.data = self._load_data()
         self.balance = self.data.get('balance', INITIAL_BALANCE)
         self.telegram_messages = []
@@ -70,12 +115,11 @@ class PositionTracker:
             logger.error(f"خطا در ذخیره: {e}")
 
     def _send_telegram(self, message):
-        """ارسال پیام به تلگرام"""
-        if not self.token or not self.chat_id:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             return False
         try:
-            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            data = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
             response = requests.post(url, data=data, timeout=30)
             return response.status_code == 200
         except Exception as e:
@@ -83,16 +127,21 @@ class PositionTracker:
             return False
 
     def process_signal(self, signal):
-        """پردازش سیگنال جدید"""
+        """پردازش سیگنال جدید با قیمت real-time"""
         try:
-            current_price = signal.get('current_price', 0)
-            if current_price == 0:
+            # گرفتن قیمت real-time از OANDA
+            current_price = self.price_fetcher.get_current_price()
+
+            if current_price is None:
+                logger.error("قیمت real-time دریافت نشد")
                 return
+
+            logger.info(f"قیمت real-time: {current_price}")
 
             positions = self.data.get('positions', [])
             closed = self.data.get('closed_positions', [])
 
-            # مرحله 1: چک پوزیشن‌های باز
+            # مرحله 1: چک پوزیشن‌های باز با قیمت real-time
             still_open = []
             for pos in positions:
                 result = self._check_position(pos, current_price)
@@ -124,12 +173,16 @@ class PositionTracker:
                 # باز کردن پوزیشن جدید
                 same_direction = [p for p in self.data['positions'] if p['direction'] == signal['direction']]
                 if not same_direction and signal.get('stop_loss') and signal.get('tp1'):
-                    new_pos = self._open_position(signal, current_price)
+                    # استفاده از قیمت real-time به‌عنوان قیمت ورود
+                    signal_copy = signal.copy()
+                    signal_copy['entry_price'] = current_price  # قیمت واقعی فعلی
+
+                    new_pos = self._open_position(signal_copy, current_price)
                     if new_pos:
                         self.data['positions'].append(new_pos)
                         msg = self._format_open_message(new_pos)
                         self.telegram_messages.append(msg)
-                        logger.info(f"پوزیشن جدید: {new_pos['direction']}")
+                        logger.info(f"پوزیشن جدید: {new_pos['direction']} در {current_price}")
 
             self._save_data()
 
@@ -137,9 +190,8 @@ class PositionTracker:
             logger.error(f"خطا در پردازش: {e}", exc_info=True)
 
     def _open_position(self, signal, current_price):
-        """باز کردن پوزیشن"""
         try:
-            entry = signal.get('entry_price', current_price)
+            entry = current_price  # قیمت واقعی فعلی
             sl = signal.get('stop_loss')
             tp1 = signal.get('tp1')
             tp2 = signal.get('tp2')
@@ -153,11 +205,12 @@ class PositionTracker:
             sl_distance = abs(entry - sl)
             sl_pips = sl_distance * 100
 
-            # محاسبه حجم
-            pip_value = 6.5  # برای USD/JPY
+            # محاسبه حجم بر اساس ریسک (2% از موجودی)
+            pip_value = 6.5  # برای USD/JPY با 1 lot
             size_lots = risk_amount / (sl_pips * pip_value) if sl_pips > 0 else 0.01
             size_lots = max(0.01, min(size_lots, 1.0))
-            size_usd = size_lots * 100000 * (entry / 100)
+            # حجم دلاری واقعی با اهرم 20x
+            size_usd = self.balance * LEVERAGE * size_lots / max(size_lots, 0.01)
             pnl_per_pip = size_lots * pip_value
 
             return {
@@ -181,7 +234,6 @@ class PositionTracker:
             return None
 
     def _check_position(self, pos, current_price):
-        """چک پوزیشن با قیمت فعلی"""
         try:
             direction = pos['direction']
             entry = pos['entry_price']
@@ -196,7 +248,7 @@ class PositionTracker:
                 if current_price >= tp2 and not pos.get('tp2_hit'):
                     pos['tp2_hit'] = True
                     return {'closed': False, 'position': pos, 'pnl': 0,
-                            'message': f"📊 TP2 Hit (+{(tp2-entry)*100:.1f} pip)"}
+                            'message': f"📊 TP2 Hit (+{(tp2-entry)*100:.1f} pip) - 30% بسته شد"}
                 if current_price >= tp1 and not pos.get('tp1_hit'):
                     pos['tp1_hit'] = True
                     pos['stop_loss'] = entry
@@ -210,7 +262,7 @@ class PositionTracker:
                 if current_price <= tp2 and not pos.get('tp2_hit'):
                     pos['tp2_hit'] = True
                     return {'closed': False, 'position': pos, 'pnl': 0,
-                            'message': f"📊 TP2 Hit (+{(entry-tp2)*100:.1f} pip)"}
+                            'message': f"📊 TP2 Hit (+{(entry-tp2)*100:.1f} pip) - 30% بسته شد"}
                 if current_price <= tp1 and not pos.get('tp1_hit'):
                     pos['tp1_hit'] = True
                     pos['stop_loss'] = entry
@@ -223,7 +275,6 @@ class PositionTracker:
             return {'closed': False, 'position': pos, 'pnl': 0, 'message': None}
 
     def _close_position(self, pos, close_price, reason=''):
-        """بستن پوزیشن"""
         try:
             direction = pos['direction']
             entry = pos['entry_price']
@@ -256,7 +307,7 @@ class PositionTracker:
                 f"💰 سود/ضرر: ${pnl:+.2f}\n"
                 f"📝 دلیل: {reason}\n"
                 f"🕐 زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-                f"💳 موجودی: ${self.balance + pnl:.2f}"
+                f"💳 موجودی جدید: ${self.balance + pnl:.2f}"
             )
 
             return {'closed': True, 'position': pos, 'pnl': pnl, 'message': message}
@@ -265,7 +316,6 @@ class PositionTracker:
             return {'closed': False, 'position': pos, 'pnl': 0, 'message': None}
 
     def _format_open_message(self, pos):
-        """فرمت پیام باز شدن پوزیشن"""
         dir_emoji = "🟢" if pos['direction'] == 'BUY' else "🔴"
         return (
             f"📊 پوزیشن باز شد\n"
@@ -276,23 +326,23 @@ class PositionTracker:
             f"🎯 TP1: {pos['tp1']:.3f}\n"
             f"🎯 TP2: {pos['tp2']:.3f}\n"
             f"🎯 TP3: {pos['tp3']:.3f}\n"
-            f"💵 حجم: ${pos['size_usd']:.0f}\n"
+            f"💵 حجم: ${pos['size_usd']:.2f}\n"
             f"🎯 ستاپ: {pos['setup_type']}\n"
             f"💳 موجودی: ${self.balance:.2f}"
         )
 
     def send_messages(self):
-        """ارسال همه پیام‌های تلگرام"""
+        sent = 0
         for msg in self.telegram_messages:
-            self._send_telegram(msg)
-        sent_count = len(self.telegram_messages)
+            if self._send_telegram(msg):
+                sent += 1
         self.telegram_messages = []
-        return sent_count
+        return sent
 
     def check_weekly_report(self):
-        """بررسی و ارسال گزارش هفتگی"""
         try:
             now = datetime.now(timezone.utc)
+            # جمعه ساعت 20:00 UTC
             if now.weekday() == WEEKLY_REPORT_DAY and WEEKLY_REPORT_HOUR <= now.hour < WEEKLY_REPORT_HOUR + 1:
                 last_report = self.data.get('last_report_date')
                 if last_report:
@@ -314,7 +364,6 @@ class PositionTracker:
             return False
 
     def _generate_report(self, now):
-        """تولید کارنامه هفتگی"""
         try:
             closed = self.data.get('closed_positions', [])
             week_ago = now - timedelta(days=7)
@@ -328,8 +377,21 @@ class PositionTracker:
                 except:
                     continue
 
+            msg = "📊 کارنامه هفتگی ربات\n"
+            msg += f"{'='*35}\n"
+            msg += f"📅 دوره: 7 روز اخیر\n"
+            msg += f"🕐 زمان: {now.strftime('%Y-%m-%d %H:%M')} UTC\n\n"
+
             if not weekly:
-                return self._empty_report(now)
+                msg += "📭 هیچ معامله‌ای این هفته بسته نشده\n\n"
+                msg += "💡 دلایل ممکن:\n"
+                msg += "• سیگنال‌ها به TP/SL نرسیدن\n"
+                msg += "• بازار رنج بوده\n"
+                msg += "• ربات اخیراً فعال شده\n"
+                msg += f"\n💳 موجودی فعلی: ${self.balance:.2f}\n"
+                msg += f"📂 پوزیشن‌های باز: {len(self.data.get('positions', []))}\n"
+                msg += f"\n{'='*35}\n🤖 ربات USD/JPY"
+                return msg
 
             total = len(weekly)
             winning = [p for p in weekly if p.get('pnl', 0) > 0]
@@ -349,36 +411,43 @@ class PositionTracker:
 
             roi = ((self.balance - INITIAL_BALANCE) / INITIAL_BALANCE) * 100
 
-            msg = "📊 کارنامه هفتگی ربات\n"
-            msg += f"{'='*35}\n📅 دوره: 7 روز اخیر\n"
-            msg += f"🕐 زمان: {now.strftime('%Y-%m-%d %H:%M')} UTC\n\n"
-
-            msg += f"💰 خلاصه مالی:\n{'-'*35}\n"
-            msg += f"💳 موجودی: ${self.balance:.2f}\n"
-            msg += f"💵 اولیه: ${INITIAL_BALANCE:.2f}\n"
+            msg += "💰 خلاصه مالی:\n"
+            msg += f"{'-'*35}\n"
+            msg += f"💳 موجودی فعلی: ${self.balance:.2f}\n"
+            msg += f"💵 موجودی اولیه: ${INITIAL_BALANCE:.2f}\n"
             pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
-            msg += f"{pnl_emoji} سود/ضرر: ${total_pnl:+.2f}\n"
-            msg += f"📈 بازدهی: {roi:+.1f}%\n"
+            msg += f"{pnl_emoji} سود/ضرر هفته: ${total_pnl:+.2f}\n"
+            msg += f"📈 بازدهی (ROI): {roi:+.1f}%\n"
             msg += f"📊 کل پیپ: {total_pips:+.1f}\n\n"
 
-            msg += f"📈 آمار:\n{'-'*35}\n"
-            msg += f"📊 کل: {total}\n🟢 سودده: {len(winning)}\n🔴 ضررده: {len(losing)}\n"
+            msg += "📈 آمار معاملات:\n"
+            msg += f"{'-'*35}\n"
+            msg += f"📊 کل معاملات: {total}\n"
+            msg += f"🟢 سودده: {len(winning)}\n"
+            msg += f"🔴 ضررده: {len(losing)}\n"
             msg += f"✅ نرخ موفقیت: {win_rate:.1f}%\n"
             msg += f"💵 میانگین سود: ${avg_win:+.2f}\n"
             msg += f"💸 میانگین ضرر: ${avg_loss:+.2f}\n\n"
 
             if best:
-                msg += f"🏆 بهترین:\n{'-'*35}\n"
-                msg += f"• {best.get('direction')} - {best.get('setup_type')}\n"
-                msg += f"• سود: ${best.get('pnl', 0):+.2f}\n\n"
+                msg += "🏆 بهترین ترید:\n"
+                msg += f"{'-'*35}\n"
+                msg += f"• جهت: {best.get('direction')}\n"
+                msg += f"• ستاپ: {best.get('setup_type')}\n"
+                msg += f"• سود: ${best.get('pnl', 0):+.2f}\n"
+                msg += f"• پیپ: {best.get('pnl_pips', 0):+.1f}\n\n"
 
             if worst:
-                msg += f"📉 بدترین:\n{'-'*35}\n"
-                msg += f"• {worst.get('direction')} - {worst.get('setup_type')}\n"
-                msg += f"• ضرر: ${worst.get('pnl', 0):+.2f}\n\n"
+                msg += "📉 بدترین ترید:\n"
+                msg += f"{'-'*35}\n"
+                msg += f"• جهت: {worst.get('direction')}\n"
+                msg += f"• ستاپ: {worst.get('setup_type')}\n"
+                msg += f"• ضرر: ${worst.get('pnl', 0):+.2f}\n"
+                msg += f"• پیپ: {worst.get('pnl_pips', 0):+.1f}\n\n"
 
             if setup_counts:
-                msg += f"📋 ستاپ‌ها:\n{'-'*35}\n"
+                msg += "📋 ستاپ‌ها:\n"
+                msg += f"{'-'*35}\n"
                 for s, c in sorted(setup_counts.items(), key=lambda x: x[1], reverse=True):
                     msg += f"• {s}: {c}\n"
                 msg += "\n"
@@ -393,39 +462,35 @@ class PositionTracker:
                 eval_text = "🔴 نیاز به بازنگری"
 
             msg += f"📋 ارزیابی: {eval_text}\n"
-            msg += f"{'='*35}\n🤖 ربات USD/JPY"
+            msg += f"\n{'='*35}\n🤖 ربات سیگنال‌دهی USD/JPY"
 
             return msg
         except Exception as e:
             logger.error(f"خطا در گزارش: {e}")
             return None
 
-    def _empty_report(self, now):
-        msg = "📊 کارنامه هفتگی\n"
-        msg += f"{'='*35}\n📅 دوره: 7 روز اخیر\n"
-        msg += f"🕐 زمان: {now.strftime('%Y-%m-%d %H:%M')} UTC\n\n"
-        msg += "📭 معامله‌ای بسته نشده\n"
-        msg += f"{'='*35}\n🤖 ربات USD/JPY"
-        return msg
-
 
 # ============================================================
 # تابع اصلی - فراخوانی از bot_action.py
 # ============================================================
-def track_signal(signal, telegram_token, telegram_chat_id):
+def track_signal(signal, telegram_token=None, telegram_chat_id=None):
     """
     فراخوانی از bot_action.py
 
     Args:
         signal: سیگنال تولید شده
-        telegram_token: توکن تلگرام
-        telegram_chat_id: شناسه چت
-
-    Returns:
-        dict: نتیجه
+        telegram_token: توکن تلگرام (اختیاری)
+        telegram_chat_id: شناسه چت (اختیاری)
     """
     try:
-        tracker = PositionTracker(telegram_token, telegram_chat_id)
+        # استفاده از متغیرهای سراسری اگه پاس داده نشده
+        global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+        if telegram_token:
+            TELEGRAM_BOT_TOKEN = telegram_token
+        if telegram_chat_id:
+            TELEGRAM_CHAT_ID = telegram_chat_id
+
+        tracker = PositionTracker()
         tracker.process_signal(signal)
         sent = tracker.send_messages()
         report_sent = tracker.check_weekly_report()
@@ -440,3 +505,36 @@ def track_signal(signal, telegram_token, telegram_chat_id):
     except Exception as e:
         logger.error(f"خطا در track_signal: {e}", exc_info=True)
         return {'success': False, 'error': str(e)}
+
+
+if __name__ == "__main__":
+    print("\n" + "=" * 50)
+    print("📊 تست Position Tracker")
+    print("=" * 50)
+
+    # تست قیمت real-time
+    print("\n1. تست قیمت real-time از OANDA...")
+    pf = PriceFetcher()
+    price = pf.get_current_price()
+    if price:
+        print(f"   ✓ قیمت فعلی: {price}")
+    else:
+        print("   ✗ خطا - OANDA_API_KEY چک کنید")
+
+    # تست با سیگنال نمونه
+    if price:
+        print("\n2. تست با سیگنال نمونه...")
+        signal = {
+            'direction': 'SELL',
+            'entry_type': 'market',
+            'entry_price': price,
+            'current_price': price,
+            'stop_loss': price + 0.2,
+            'tp1': price - 0.2,
+            'tp2': price - 0.4,
+            'tp3': price - 0.6,
+            'setup_type': 'Test',
+            'strength': 70
+        }
+        result = track_signal(signal)
+        print(f"   نتیجه: {result}")
