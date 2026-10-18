@@ -119,17 +119,51 @@ logger = logging.getLogger(__name__)
 # Session Detector
 # ============================================================
 class SessionDetector:
-    """تشخیص سشن معاملاتی فعلی"""
+    """تشخیص سشن معاملاتی فعلی - با تشخیص روزهای تعطیل"""
 
     def get_current_session(self):
         try:
             # زمان فعلی UTC
             now_utc = datetime.now(timezone.utc)
             hour = now_utc.hour
+            weekday = now_utc.weekday()  # 0=دوشنبه، 5=شنبه، 6=یکشنبه
 
+            # ============================================
+            # فیلتر روزهای تعطیل فارکس
+            # فارکس: دوشنبه 00:00 تا جمعه 22:00 UTC (برای بروکرهای استاندارد)
+            # شنبه و یکشنبه: بسته
+            # جمعه بعد از 22:00 UTC: بسته
+            # دوشنبه قبل از 00:00 UTC: بسته (هنوز باز نشده)
+            # ============================================
+            is_closed_day = False
+            close_reason = ""
+
+            if weekday == 5:  # شنبه
+                is_closed_day = True
+                close_reason = "شنبه - بازار تعطیل"
+            elif weekday == 6:  # یکشنبه
+                is_closed_day = True
+                close_reason = "یکشنبه - بازار تعطیل"
+            elif weekday == 4 and hour >= 22:  # جمعه بعد از 22:00 UTC
+                is_closed_day = True
+                close_reason = "جمعه شب - بازار بسته شد"
+
+            if is_closed_day:
+                return {
+                    'name': f'بسته 🌙 ({close_reason})',
+                    'is_active': False,
+                    'is_best_time': False,
+                    'description': f'بازار بسته - {close_reason}',
+                    'weekday': weekday,
+                    'hour_utc': hour,
+                }
+
+            # ============================================
+            # بررسی سشن‌های فعال (فقط در روزهای کاری)
+            # ============================================
             sessions = []
 
-            # بررسی همپوشانی (بهترین زمان)
+            # همپوشانی (بهترین زمان)
             if SESSIONS['overlap']['start'] <= hour < SESSIONS['overlap']['end']:
                 sessions.append('overlap')
 
@@ -151,6 +185,8 @@ class SessionDetector:
                     'is_active': False,
                     'is_best_time': False,
                     'description': 'بازار بسته - ترید توصیه نمی‌شه',
+                    'weekday': weekday,
+                    'hour_utc': hour,
                 }
 
             # اولویت: overlap > london > new_york > asia
@@ -171,6 +207,7 @@ class SessionDetector:
                 'is_best_time': is_best,
                 'primary': primary,
                 'all_active': sessions,
+                'weekday': weekday,
                 'hour_utc': hour,
                 'description': f"سشن {SESSIONS[primary]['name']} (UTC: {hour}:00)",
             }
